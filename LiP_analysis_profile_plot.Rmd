@@ -1,0 +1,162 @@
+---
+  title: "JM_02"
+output:
+  html_document: default
+word_document: default
+pdf_document: default
+date: "2024-03-22"
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Preperation
+
+## Loading packages 
+
+```{r loading_packages, message=FALSE, warning=FALSE}
+
+library(protti)
+library(tidyverse)
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(lsr)
+library(hash)
+library(reshape2)
+
+```
+
+## Loading data
+
+
+```{r loading_data, message=FALSE, warning=FALSE}
+
+setwd("Z:/jumogl/JM002_LiPSchool/Spectronaut output")
+
+DIA_raw <- read_protti("20240321_153536_20240320093116_Report.csv")
+```
+## filter data
+
+```{r cleaning_data, message = FALSE, warning = FALSE}
+
+
+DIA_raw$intensity_log2 <- log2(DIA_raw$pep_ms2quantity)
+
+
+DIA_raw_norm <- normalise(DIA_raw,
+  sample = r_file_name,
+  intensity_log2 = intensity_log2,
+  method = "median"
+)
+
+
+DIA_clean <- DIA_raw_norm %>%
+  filter(eg_qvalue <= 1e-5) %>%
+  #filter(pg_fasta_files != "contaminants", pg_fasta_files != "NaN") %>%
+  filter(fg_ms2raw_quantity > 1000) %>%
+  #mutate(intensity_log2 = log2(fg_quantity)) %>%
+  filter(pep_is_proteotypic == T)# %>%
+  #mutate(uniprot_id = pg_protein_accessions)
+
+
+
+
+
+unis <- unique(DIA_clean$pg_protein_accessions) # make vector for fetch_uniprot
+```
+## Load data from uniprot and join with DIA dataframe
+
+```{r uniprot, message = FALSE, warning = FALSE}
+
+uniprot <- # download protein information from UniProt
+  fetch_uniprot(
+    unis,
+    columns =  c(
+      "protein_name",
+      "gene_names",
+      "length",
+      "sequence",
+      "xref_pdb"
+    )
+  ) #%>%
+  # rename(
+  #   protein_sequence = sequence,
+  #   length_protein = length,
+  #   uniprot_id = accession
+  # )
+
+DIA_clean_uniprot <- DIA_clean %>%
+  left_join(uniprot, by = c("pg_protein_accessions" = "accession")) %>% # rejoin with annotations
+  find_peptide(sequence, pep_stripped_sequence) %>%
+  assign_peptide_type(aa_before, last_aa, aa_after) %>%
+  # sequence_coverage(sequence, pep_stripped_sequence) %>%
+  distinct()
+
+DIA_clean_uniprot$condrep <- paste(DIA_clean_uniprot$r_condition, DIA_clean_uniprot$r_replicate, sep = "_")
+
+proteins_identified <- uniprot %>%
+  distinct(accession)
+
+# fwrite(proteins_identified, file = "identified_proteins_CaM_LiP.csv", sep = ",")
+
+
+```
+
+## profile plot per protein
+
+
+```{r intensity across conditions profile plot matrix version, message=FALSE, warning=FALSE}
+#condrep per peptide
+#DIA_clean_uniprot$condreppep <- paste(DIA_clean_uniprot$condrep, DIA_clean_uniprot$pep_stripped_sequence, sep = "_")
+
+#generate subset and group by stripped sequence and condition
+
+subs <- subset(DIA_clean_uniprot, pg_protein_accessions == "P62942")
+subs$condtype <-  paste(substr(subs$condrep, 0 ,4))
+subs <-  arrange(subs,pep_stripped_sequence, condtype)
+
+#get unique set of conditions and pep_stripped_sequences
+conditions <- subs$condrep[!duplicated(subs$condrep)]
+sequences <- subs$pep_stripped_sequence[!duplicated(subs$pep_stripped_sequence)]
+
+#generate matrix of zeros for the intensities
+df <- data.frame()
+for (i in 1:length(conditions)){
+  column = numeric(length(sequences))
+  df = rbind(df, column)
+}
+
+colnames(df)<-sequences
+rownames(df)<-conditions
+df$condrep = conditions
+#fill in data
+#iterate over conditions
+for (i in 1:length(conditions)){
+  #iterate over sequences
+  for (j in 1:length(sequences)){
+    #generate sub-subset containing only values for given condition and sequence (single value or list of duplicates)
+    x <- subset(subs, pep_stripped_sequence == sequences[j] & condrep == conditions[i])
+    #eliminate duplicate values and save in dataframe
+     value <- as.numeric(x$normalised_intensity_log2[!duplicated(x$normalised_intensity_log2)])
+     #fix if there are no values - doesn't try to overwrite zero with empty value
+    if (length(value) > 0){
+      df[i,j] <- value
+    }
+  }
+}
+df_m <- melt(df)
+
+ggplot(df, aes(condrep)) +
+  geom_line(data = df_m, aes(x=condrep, y=value, group = variable, colour = variable))+
+  scale_x_discrete(guide = guide_axis(angle = 90))+
+  xlab("Condition")+
+  ylab("Normalised Log2 Intensity")
+
+
+
+```
