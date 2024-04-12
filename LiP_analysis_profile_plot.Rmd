@@ -111,8 +111,6 @@ proteins_identified <- uniprot %>%
 
 
 ```{r intensity across conditions profile plot matrix version, message=FALSE, warning=FALSE}
-#condrep per peptide
-#DIA_clean_uniprot$condreppep <- paste(DIA_clean_uniprot$condrep, DIA_clean_uniprot$pep_stripped_sequence, sep = "_")
 
 #generate subset and group by stripped sequence and condition
 
@@ -155,7 +153,9 @@ ggplot(df, aes(condrep)) +
   geom_line(data = df_m, aes(x=condrep, y=value, group = variable, colour = variable))+
   scale_x_discrete(guide = guide_axis(angle = 90))+
   xlab("Condition")+
-  ylab("Normalised Log2 Intensity")
+  ylab("Normalised Log2 Intensity")+
+  theme(legend.key.size = unit(0.83, "lines"))
+
 
 
 
