@@ -108,13 +108,13 @@ proteins_identified <- uniprot %>%
 ```
 
 ## profile plot per protein
-
+"P62942"
 
 ```{r intensity across conditions profile plot matrix version, message=FALSE, warning=FALSE}
-
+proteinacc = 	"P62942"
 #generate subset and group by stripped sequence and condition
 
-subs <- subset(DIA_clean_uniprot, pg_protein_accessions == "P62942")
+subs <- subset(DIA_clean_uniprot, pg_protein_accessions == proteinacc)
 subs$condtype <-  paste(substr(subs$condrep, 0 ,4))
 subs <-  arrange(subs,pep_stripped_sequence, condtype)
 
@@ -154,8 +154,9 @@ ggplot(df, aes(condrep)) +
   scale_x_discrete(guide = guide_axis(angle = 90))+
   xlab("Condition")+
   ylab("Normalised Log2 Intensity")+
-  theme(legend.key.size = unit(0.83, "lines"))
-
+  theme(legend.key.size = unit(0.832, "lines"))+
+  geom_point(data = df_m, aes(condrep, value))+
+  ggtitle(proteinacc)
 
 
 
