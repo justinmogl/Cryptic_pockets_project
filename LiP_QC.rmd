@@ -1,0 +1,303 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Preperation
+
+## Loading packages 
+
+```{r loading_packages, message=FALSE, warning=FALSE}
+library(protti)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+
+```
+
+## Loading data
+
+
+```{r loading_data, message=FALSE, warning=FALSE}
+working_directory = "Z:/jumogl/JM003_AT222/spectronaut output"
+
+file_name = "20240411_162202_20240407072240_Report_Eclipse_MD.csv"
+
+
+setwd(working_directory)
+
+DIA_raw <- read_protti(file_name)
+
+
+mainDir <- working_directory
+subDir <- paste("Plots", file_name) 
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+mainDir <- file.path(mainDir, subDir)
+
+```
+
+
+```{r cleaning_data, message=FALSE, warning=FALSE}
+#why not fg_quantity as on protti page? 
+
+DIA_raw_norm<- DIA_raw %>%
+  filter(eg_is_decoy == FALSE) %>%
+  mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
+  normalise(
+    sample = r_file_name,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  ) %>%
+  filter(pep_is_proteotypic == TRUE)
+
+DIA_clean <- DIA_raw_norm %>% filter(normalised_intensity_log2 > 5)
+
+DIA_clean$raw_intensity <- 2^DIA_clean$normalised_intensity_log2
+  
+unis <- unique(DIA_clean$pg_protein_accessions)
+
+```
+
+## Load data from uniprot and join with DIA dataframe
+
+```{r uniprot, message = FALSE, warning = FALSE}
+
+uniprot <- # download protein information from UniProt
+  fetch_uniprot(
+    unis,
+    columns =  c(
+      "protein_name",
+      "gene_names",
+      "length",
+      "sequence",
+      "xref_pdb"
+    )
+  ) #%>%
+  # rename(
+  #   protein_sequence = sequence,
+  #   length_protein = length,
+  #   uniprot_id = accession
+  # )
+
+DIA_clean_uniprot <- DIA_clean %>%
+  left_join(uniprot, by = c("pg_protein_accessions" = "accession")) %>% # rejoin with annotations
+  find_peptide(sequence, pep_stripped_sequence) %>%
+  assign_peptide_type(aa_before, last_aa, aa_after) %>%
+  # sequence_coverage(sequence, pep_stripped_sequence) %>%
+  distinct()
+
+DIA_clean_uniprot$condrep <- paste(DIA_clean_uniprot$r_condition, DIA_clean_uniprot$r_replicate, sep = "_")
+
+proteins_identified <- uniprot %>%
+  distinct(accession)
+
+# fwrite(proteins_identified, file = "identified_proteins_CaM_LiP.csv", sep = ",")
+
+
+```
+
+
+```{r QC, message=FALSE, warning=FALSE}
+
+subDir <- "QC_plots"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+
+qc_cvs(
+  data = DIA_clean_uniprot,
+  grouping = fg_id,
+  condition = r_condition,
+  intensity = raw_intensity,
+  plot = FALSE
+)
+
+plot <- qc_cvs(
+  data = DIA_clean_uniprot,
+  grouping = fg_id,
+  condition = r_condition,
+  intensity = raw_intensity,
+  plot = TRUE,
+  plot_style = "violin"
+)
+
+ggsave(filename = "violin_plot_raw.png", plot = plot)
+
+plot
+
+plot <- qc_ids(DIA_clean_uniprot, r_file_name, pg_protein_accessions, condition = r_condition, intensity = normalised_intensity_log2)
+
+ggsave(filename = "protein_identifications.png", plot = plot)
+
+plot
+
+
+plot <- qc_peptide_type(
+  DIA_clean_uniprot,
+  condrep,
+  fg_id,
+  pep_type,
+  intensity = normalised_intensity_log2,
+  method = "count",
+  plot = TRUE,
+  interactive = FALSE
+)
+
+ggsave(filename = "peptide_type_intesity.png", plot = plot)
+
+plot
+
+plot <- qc_peptide_type(
+  DIA_clean_uniprot,
+  condrep,
+  fg_id,
+  pep_type,
+  intensity = normalised_intensity_log2,
+  method = "intensity",
+  plot = TRUE,
+  interactive = FALSE
+)
+ggsave(filename = "peptide_types.png", plot = plot)
+
+plot
+
+plot <- qc_intensity_distribution(
+  DIA_clean_uniprot,
+  condrep,
+  fg_id,
+  intensity_log2,
+  plot_style = "boxplot"
+)
+
+ggsave(filename = "run_intensities.png", plot = plot)
+
+plot
+
+plot <- qc_median_intensities(
+  DIA_clean_uniprot,
+  r_file_name,
+  pep_grouping_key,
+  normalised_intensity_log2,
+  plot = TRUE,
+  interactive = FALSE
+)
+
+ggsave(filename = "medians_of_run_intensities.png", plot = plot)
+
+plot
+
+plot <- qc_charge_states(
+  DIA_clean_uniprot,
+  r_file_name,
+  pep_grouping_key,
+  intensity = raw_intensity,
+  method = "intensity",
+  charge_states = fg_charge,
+  plot = TRUE,
+)
+
+ggsave(filename = "charge_distribution.png", plot = plot)
+
+plot
+
+plot <- qc_missed_cleavages(
+  DIA_clean_uniprot,
+  r_file_name,
+  fg_id,
+  pep_nr_of_missed_cleavages,
+  fg_quantity,
+  method = "intensity",
+  plot = TRUE,
+  interactive = FALSE
+)
+
+ggsave(filename = "missed_cleavages.png", plot = plot)
+
+plot
+
+DIA_clean_uniprot <- calculate_sequence_coverage(DIA_clean_uniprot, protein_sequence = sequence, peptides = pep_stripped_sequence)
+
+plot <- qc_sequence_coverage(
+  data = DIA_clean_uniprot,
+  protein_identifier = pg_protein_accessions,
+  coverage = coverage
+)
+
+ggsave(filename = "protein_coverage_distribution.png", plot = plot)
+
+plot
+
+plot <- qc_data_completeness(
+  data = DIA_clean_uniprot,
+  sample = r_file_name,
+  grouping = pep_stripped_sequence,
+  intensity = normalised_intensity_log2,
+  plot = TRUE
+)
+
+ggsave(filename = "data_completeness.png", plot = plot)
+
+plot
+
+plot <- qc_intensity_distribution(
+  data = DIA_clean_uniprot,
+  grouping = fg_id,
+  intensity_log2 = normalised_intensity_log2,
+  plot_style = "histogram"
+)
+ggsave(filename = "overall_log2_intensity_distribution.png", plot = plot)
+
+plot
+
+plot <- qc_pca(
+  data = DIA_clean_uniprot,
+  sample = r_file_name,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  condition = r_condition,
+  plot_style = "scree"
+)
+
+ggsave(filename = "PCA_scree.png", plot = plot)
+
+plot
+
+plot <- qc_pca(
+  data = DIA_clean_uniprot,
+  sample = r_file_name,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  condition = r_condition,
+  plot_style = "pca"
+)
+
+ggsave(filename = "PCA.png", plot = plot)
+
+plot
+
+plot <- qc_ranked_intensities(
+  data = DIA_clean_uniprot,
+  sample = r_file_name,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  plot= TRUE
+)
+
+ggsave(filename = "ranked_intesities.png", plot = plot)
+
+plot
+
+
+```
