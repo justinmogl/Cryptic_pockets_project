@@ -1,0 +1,314 @@
+---
+  title: "JM_02"
+output:
+  html_document: default
+word_document: default
+pdf_document: default
+date: "2024-03-22"
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Preperation
+
+## Loading packages 
+
+```{r loading_packages, message=FALSE, warning=FALSE}
+
+library(protti)
+library(tidyverse)
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(lsr)
+library(reshape2)
+
+```
+
+## Loading data
+
+
+```{r loading_data, message=FALSE, warning=FALSE}
+
+working_directory = "Z:/jumogl/JM002_LiPSchool/Spectronaut output"
+
+file_name = "20240321_153536_20240320093116_Report.csv"
+
+
+setwd(working_directory)
+
+DIA_raw <- read_protti(file_name)
+
+
+mainDir <- working_directory
+subDir <- paste("Plots", file_name) 
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+mainDir <- file.path(mainDir, subDir)
+
+```
+## filter data
+
+```{r cleaning_data, message = FALSE, warning = FALSE}
+
+
+
+
+DIA_raw$intensity_log2 <- log2(DIA_raw$pep_ms2quantity)
+
+
+DIA_raw_norm <- normalise(DIA_raw,
+  sample = r_file_name,
+  intensity_log2 = intensity_log2,
+  method = "median"
+)
+
+
+DIA_clean <- DIA_raw_norm %>%
+  filter(eg_qvalue <= 1e-5) %>%
+  #filter(pg_fasta_files != "contaminants", pg_fasta_files != "NaN") %>%
+  filter(fg_ms2raw_quantity > 1000) %>%
+  #mutate(intensity_log2 = log2(fg_quantity)) %>%
+  filter(pep_is_proteotypic == T)# %>%
+  #mutate(uniprot_id = pg_protein_accessions)
+
+
+
+
+
+unis <- unique(DIA_clean$pg_protein_accessions) # make vector for fetch_uniprot
+
+
+```
+## Load data from uniprot and join with DIA dataframe
+
+```{r uniprot, message = FALSE, warning = FALSE}
+
+uniprot <- # download protein information from UniProt
+  fetch_uniprot(
+    unis,
+    columns =  c(
+      "protein_name",
+      "gene_names",
+      "length",
+      "sequence",
+      "xref_pdb"
+    )
+  ) #%>%
+  # rename(
+  #   protein_sequence = sequence,
+  #   length_protein = length,
+  #   uniprot_id = accession
+  # )
+
+DIA_clean_uniprot <- DIA_clean %>%
+  left_join(uniprot, by = c("pg_protein_accessions" = "accession")) %>% # rejoin with annotations
+  find_peptide(sequence, pep_stripped_sequence) %>%
+  assign_peptide_type(aa_before, last_aa, aa_after) %>%
+  # sequence_coverage(sequence, pep_stripped_sequence) %>%
+  distinct()
+
+DIA_clean_uniprot$condrep <- paste(DIA_clean_uniprot$r_condition, DIA_clean_uniprot$r_replicate, sep = "_")
+
+proteins_identified <- uniprot %>%
+  distinct(accession)
+
+# fwrite(proteins_identified, file = "identified_proteins_CaM_LiP.csv", sep = ",")
+
+
+```
+
+#Data analysis
+
+
+## Volcano plots precurser lvl
+
+
+```{r Volcano_plot, message = FALSE, warning = FALSE}
+
+
+subDir <- "Output_plots"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+
+Volcano_input <- DIA_clean_uniprot %>%
+  unique() %>%
+  assign_missingness(r_file_name,
+                     r_condition,
+                     pep_stripped_sequence,
+                     normalised_intensity_log2,
+                     ref_condition = "DMSO_LiP",
+                     retain_columns = c(pg_protein_accessions, pep_grouping_key, start, end, pep_type, sequence, length))
+
+
+t_test_result_pre <- calculate_diff_abundance(data = Volcano_input,
+                                r_file_name,
+                                r_condition,
+                                pep_stripped_sequence,
+                                normalised_intensity_log2,
+                                missingness,
+                                comparison = comparison,
+                                ref_condition = "DMSO_LiP",
+                                method = "moderated_t-test",
+                                retain_columns = c(pg_protein_accessions, pep_grouping_key, start, end, pep_type, sequence, length))
+
+
+
+
+
+condition_vulcano <- c("Rapa_LiP_vs_DMSO_LiP")
+t_test_result_proDA_pep_comp <- t_test_result_pre[t_test_result_pre$comparison %in% condition_vulcano, ]
+
+
+plot <- volcano_plot(t_test_result_proDA_pep_comp, pep_stripped_sequence, diff, adj_pval, method = "target", target_column = pg_protein_accessions, target = c("P62942") ,  x_axis_label = "log2(fold change) ", title = "Volcano plot peptide level", y_axis_label = "-log10(p-value)", log2FC_cutoff = 1, significance_cutoff = 0.01, interactive = F)
+
+ggsave("volcano_plot.png", plot = plot)
+#volcano_plot(t_test_result_proDA_pep_comp, pep_grouping_key, diff, adj_pval, method = "target", target_column = pg_protein_accessions, target = c("P24941") ,  x_axis_label = "log2(fold change)", title = "Volcano plot precursor level", y_axis_label = "-log10(q-value)", log2FC_cutoff = 1, significance_cutoff = 0.05, interactive = T)
+
+
+pep_hits <- subset(t_test_result_proDA_pep_comp, adj_pval < 0.01 & (diff < -1 | diff > 1))
+protein_hits <- pep_hits$pg_protein_accessions[!duplicated(pep_hits$pg_protein_accessions)]
+
+
+
+```
+
+
+
+## Woods plot
+
+```{r woods, fig.align = "center", message = FALSE, warning = FALSE}
+setwd(file.path(mainDir, subDir))
+
+for (i in 1:length(protein_hits)){
+  plot <- t_test_result_proDA_pep_comp %>%
+    filter(pg_protein_accessions == protein_hits[i]) %>%
+    mutate(significant = ifelse(adj_pval < 0.01, TRUE, FALSE)) %>%
+    drop_na() %>%
+    woods_plot(diff,
+               start,
+               end,
+               length,
+               protein_id = pg_protein_accessions,
+               highlight = significant,
+               #colouring = pep_type,
+               colouring = adj_pval,
+               fold_change_cutoff = 1)
+  ggsave(filename = paste(protein_hits[i], "Woods_plot.png"))
+}
+
+
+
+```
+
+##Barcode plot
+
+```{r Barcode, message = FALSE, warning = FALSE}
+setwd(file.path(mainDir, subDir))
+
+for (i in 1:length(protein_hits)){
+  plot <- t_test_result_proDA_pep_comp %>%
+    filter(pg_protein_accessions == protein_hits[i]) %>%
+    barcode_plot(start,
+                 end,
+                 length,
+                 cutoffs = c(diff = 1, adj_pval = 0.01)
+                 )
+  ggsave(filename = paste(protein_hits[i], "barcode.png"), plot = plot)
+}
+
+
+```
+
+#defining profile plot function
+```{r intensity across conditions profile plot as function, message=FALSE, warning=FALSE}
+#columns of data as variables not working for some reason
+profile_plot <- function(data, hits, intensity_log2 = "normalised_intensity_log2"){
+  #generate subset and group by stripped sequence and condition
+  for (p in 1:length(hits)){
+    subs <- subset(data, pg_protein_accessions == hits[p])
+    subs <-  arrange(subs,pep_stripped_sequence, r_condition)
+    subs$condrep <- paste(subs$r_condition, subs$r_replicate, sep = "_")
+    #get unique set of conditions and pep_stripped_sequences
+    conditions <- subs$condrep[!duplicated(subs$condrep)]
+    conditions <- str_sort(conditions)
+    sequences <- subs$pep_stripped_sequence[!duplicated(subs$pep_stripped_sequence)]
+    
+    
+    #generate matrix of zeros for the intensities
+    df <- data.frame()
+    for (i in 1:length(conditions)){
+      column = numeric(length(sequences))
+      df = rbind(df, column)
+    }
+    
+    colnames(df)<-sequences
+    rownames(df)<-conditions
+    df$condrep = conditions
+    #return(df)
+    #fill in data
+    #iterate over conditions
+    for (i in 1:length(conditions)){
+      #iterate over sequences
+      for (j in 1:length(sequences)){
+        #generate sub-subset containing only values for given condition and sequence (single value or list of duplicates)
+        x <- subset(subs, pep_stripped_sequence == sequences[j] & condrep == conditions[i])
+        #eliminate duplicate values and save in dataframe
+         value <- as.numeric(x$intensity_log2[!duplicated(x$intensity_log2)])
+         #fix if there are no values - doesn't try to overwrite zero with empty value
+        if (length(value) > 0){
+          df[i,j] <- value
+        }
+      }
+    }
+    df_m <- melt(df)
+    
+    #sizing constant depending on size of legend
+    aspect = length(sequences)%/%15 * 0.35 + 0.65
+    plot <- ggplot(df, aes(condrep)) +
+      geom_line(data = df_m, aes(x=condrep, y=value, group = variable, colour = variable))+
+      scale_x_discrete(guide = guide_axis(angle = 90))+
+      xlab("Condition")+
+      ylab("Normalised Log2 Intensity")+
+      theme(legend.key.size = unit(0.832, "lines"))+
+      geom_point(data = df_m, aes(condrep, value))+
+      ggtitle(hits[p])
+    ggsave(filename = paste(protein_hits[p], "profile_plot.png", sep = "_"), height = 5, width = 7 * aspect,  plot = plot)
+  }
+}
+
+```
+
+
+#profile plots function: input data and list of accessions of protein hits
+```{r intensity across conditions profile plot, message=FALSE, warning=FALSE}
+setwd(file.path(mainDir, subDir))
+
+profile_plot(DIA_clean_uniprot, protein_hits)
+
+
+
+```
+
+
+
+
