@@ -1,0 +1,532 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Preperation
+
+## Loading packages 
+
+```{r loading_packages, message=FALSE, warning=FALSE}
+library(protti)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+library(reshape2)
+```
+
+## Loading data
+
+
+```{r loading_data, message=FALSE, warning=FALSE}
+
+working_directory = "Z:/jumogl/JM002_LiPSchool/Spectronaut output"
+file_name = "20240321_153536_20240320093116_Report.csv"
+
+setwd(working_directory)
+
+DIA_raw <- read_protti(file_name)
+
+mainDir <- working_directory
+subDir <- "Plots_Imputation"
+
+if (file.exists(subDir)){
+  setwd(file.path(mainDir, subDir))
+} else {
+  dir.create(file.path(mainDir, subDir))
+  setwd(file.path(mainDir, subDir))
+  
+}
+
+mainDir <- file.path(mainDir, subDir)
+
+
+
+
+```
+
+```{r cleaning_data, message=FALSE, warning=FALSE}
+
+subDir <- "QC"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+DIA_raw_norm<- DIA_raw %>%
+  filter(eg_is_decoy == FALSE) %>%
+  mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
+  normalise(
+    sample = r_sample,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  ) %>%
+  filter(pep_is_proteotypic == TRUE)%>%
+  filter(fg_ms2raw_quantity > 32)
+
+
+plot <- qc_intensity_distribution(
+  data = DIA_raw_norm,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  plot_style = "histogram"
+)
+plot
+ggsave("Intensity_distribution_raw.pdf", plot = plot)
+
+
+
+
+
+```
+
+
+```{r LG_imputation_function, message=FALSE, warning=FALSE}
+impute_MNAR <- function(n_missing, min, sd, rnk){
+  	rnorm(n_missing, mean = min - log2(3), sd = sd)[rnk] }
+
+impute_MAR <- function(n_missing, mean, sd, rnk){
+	  rnorm(n_missing, mean = mean, sd = sd)[rnk] }
+
+impute_DIA4 <- function(data, r_condition, r_condrep, precursor, intensity){
+	data_imputed <- data %>%
+		dplyr::select({{r_condrep}}, {{r_condition}}, {{precursor}}, {{intensity}})%>%
+		tidyr::complete({{precursor}}) %>%
+		dplyr::arrange(!is.na({{intensity}}), {{r_condrep}}) %>% 
+		group_by({{precursor}}, {{r_condition}})%>%
+		dplyr::mutate(mean = mean({{intensity}}, na.rm = TRUE)) %>%
+		dplyr::mutate(sd = sd({{intensity}}, na.rm = TRUE))%>%
+		dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+		dplyr::mutate(repl = dplyr::n())%>%
+		dplyr::mutate(rnk = 1:dplyr::n())%>%
+		group_by({{precursor}})%>%
+		dplyr::mutate(sd = mean(sd, na.rm = TRUE))%>%
+		dplyr::mutate(min = min({{intensity}}, na.rm = TRUE))%>%
+		rowwise() %>%
+		dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(is.na({{intensity}}), 	
+												ifelse(repl - missing == 0, impute_MNAR(missing, min, sd, rnk), 
+													impute_MAR(missing, mean, sd, rnk)), {{intensity}})) %>%
+		dplyr::mutate(imputed = is.na({{intensity}}))%>%
+		dplyr::select({{r_condrep}}, {{precursor}}, normalised_intensity_imputed_log2, imputed)%>%
+		ungroup()
+	data %>%
+		left_join(data_imputed, by = c(as_label(enquo(r_condrep)), as_label(enquo(precursor))))
+}
+
+
+
+```
+
+```{r vivi_imputation_function (no MAR imputation), message=FALSE, warning=FALSE}
+
+impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_condition, reference_condition, intensity, cutoff_MAR, cutoff_MNAR, retain_columns = NULL){
+  
+  data_complete <- data %>% 
+    filter( {{ condition }} %in% c(treatment_condition, reference_condition)) %>% 
+    distinct( {{ grouping }}, {{ condition }}, {{ replicate }}, {{ intensity }} ) %>% 
+    complete( {{ grouping }}, {{ condition }},
+              {{ replicate }}, fill = list(area = NA))
+  
+  result <- data %>%
+    filter( {{ condition }} %in% c(treatment_condition, reference_condition)) %>%
+    distinct({{ condition }}, {{ grouping }}, {{ replicate }}) %>%
+    group_by( {{ condition }},  {{ grouping }}) %>%
+    mutate(n_observations = n()) %>%
+    ungroup() %>%
+    mutate(missingness = "complete") %>%
+    mutate(missingness = ifelse(n_observations < cutoff_MAR, "MAR", missingness)) %>%
+    mutate(missingness = ifelse(n_observations <= cutoff_MNAR, "MNAR", missingness)) %>%
+    distinct( {{ condition }},  {{ grouping }}, n_observations, missingness) %>%
+    right_join(data_complete,
+               by = c(rlang::as_name(rlang::enquo(condition)), rlang::as_name(rlang::enquo(grouping)))) %>%
+    mutate(n_observations = ifelse(is.na(n_observations), 0, n_observations)) %>%
+    mutate(missingness = ifelse(is.na(missingness), "MNAR", missingness)) %>%
+    mutate(comparison = paste(treatment_condition, "vs", reference_condition, sep = "_")) %>%
+    #mutate({{ condition }} = paste( {{ induction }},  {{ condition }}, sep = "_")) %>%
+    mutate(new_sample_id = paste({{ condition }}, {{ replicate }}, sep = "_")) %>%
+    group_by( {{ condition }},  {{ grouping }}) %>%
+    mutate(mean = mean({{ intensity }}, na.rm = TRUE)) %>%
+    mutate(sd = sd({{ intensity }}, na.rm = TRUE)) %>%
+    mutate(min = min(mean)) %>%
+    ungroup()
+  
+  
+  complete_peptides <- result %>% 
+    filter(missingness == "complete") %>% 
+    pull({{ grouping }}) %>% 
+    unique()
+  
+  MNAR_peptides_to_remove <- result %>% 
+    filter(missingness == "MNAR") %>% 
+    filter(!{{ grouping }} %in% complete_peptides) %>% 
+    pull({{ grouping }}) %>% 
+    unique()
+  
+  result <- result %>% 
+    #filter(!{{ grouping }} %in% MNAR_peptides_to_remove) %>% 
+    group_by({{ grouping }}) %>%
+    mutate(mean = ifelse(is.na(mean), mean({{ intensity }}, na.rm = TRUE), mean)) %>% 
+    mutate(sd = ifelse(is.na(sd), mean(sd, na.rm = TRUE), sd)) %>% 
+    mutate(min = ifelse(is.na(min), min(mean), min)) %>% 
+    ungroup() %>% 
+    mutate(mean_calc = ifelse(missingness == "MNAR", min - 3, mean)) %>% 
+    group_by(new_sample_id, {{ condition }}, {{ grouping }}, {{ intensity }}, missingness, comparison) %>% 
+    do(imputed_intensity = suppressWarnings(rnorm(1, mean = .$mean_calc, sd = .$sd))) %>% 
+    mutate(imputed_intensity = ifelse(is.na({{ intensity }}), imputed_intensity, {{ intensity }})) %>% 
+    filter(!(is.na({{ intensity }}) & missingness %in% c("complete", "MAR"))) %>% 
+    filter(!(is.nan(imputed_intensity)))
+
+  if (missing(retain_columns)) {
+    return(result)
+  } else {
+    join_result <- data %>%
+      dplyr::ungroup() %>%
+      dplyr::select(!!enquo(retain_columns), colnames(result)[!colnames(result) %in% c("imputed_intensity", "missingness", "comparison", "new_sample_id")]) %>%
+      dplyr::distinct() %>%
+      dplyr::right_join(result, by = colnames(result)[!colnames(result) %in% c("imputed_intensity", "missingness", "comparison", "new_sample_id")]) %>%
+      # Arrange by grouping but in a numeric order of the character vector.
+      dplyr::arrange(factor({{ grouping }}, levels = unique(stringr::str_sort({{ grouping }}, numeric = TRUE))))
+    
+    return(join_result)
+  }
+  
+}
+
+```
+
+
+```{r imputing_values_LG, message=FALSE, warning=FALSE}
+
+setwd(mainDir)
+
+DIA_raw_prot <- DIA_raw_norm%>%filter(normalised_intensity_log2 > 5) %>% filter(pep_is_proteotypic == TRUE)
+
+#generate NA for missing values
+DIA_NA <- DIA_raw_prot %>% 
+  filter( r_condition %in% c("Rapa_LiP", "DMSO_LiP")) %>% 
+  distinct( fg_id, r_condition, r_replicate, fg_ms2raw_quantity, .keep_all = TRUE ) %>% 
+  complete( fg_id, r_condition,
+            r_replicate, fill = list(area = NA))
+
+
+#get missingness for LG df
+missingness <- DIA_raw_norm %>% assign_missingness(condrep,
+                     r_condition,
+                     fg_id,
+                     normalised_intensity_log2,
+                     ref_condition = "DMSO_LiP",
+                     retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+
+
+#match fg_ids to accessions, peptide sequences and missingness
+get_protein_keys <- function(data){
+  fg_df <- data %>% distinct(fg_id, .keep_all = TRUE)
+  protein_accessions <- data.frame(row.names=c(fg_df$fg_id), val=c(fg_df$pg_protein_accessions))
+  return (protein_accessions)
+}
+
+get_pep_keys <- function(data){
+  fg_df <- data %>% distinct(fg_id, .keep_all = TRUE)
+  pep_sequences <- data.frame(row.names=c(fg_df$fg_id), val=c(fg_df$pep_stripped_sequence))
+  return (pep_sequences)
+}
+get_missingness_keys <- function(data){
+  fg_df <- data %>% distinct(fg_id, .keep_all = TRUE)
+  miss <- data.frame(row.names=c(fg_df$fg_id), val=c(fg_df$missingness))
+  return (miss)
+}
+
+
+protein_keys <- get_protein_keys(DIA_raw)
+pep_keys <- get_pep_keys(DIA_raw)
+missingness_key <-  get_missingness_keys(missingness)
+
+
+DIA_NA$pep_stripped_sequence[is.na(DIA_NA$pep_stripped_sequence)] <- pep_keys[DIA_NA$fg_id[is.na(DIA_NA$pep_stripped_sequence)],]
+DIA_NA$pg_protein_accessions[is.na(DIA_NA$pg_protein_accessions)] <- protein_keys[DIA_NA$fg_id[is.na(DIA_NA$pg_protein_accessions)],]
+
+
+#add condrep
+DIA_NA$condrep <- paste(DIA_NA$r_condition, DIA_NA$r_replicate, sep = "_")
+
+plot <- qc_intensity_distribution(
+  data = DIA_raw_norm,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  plot_style = "histogram"
+)
+plot
+ggsave("Intensity_distribution_raw.pdf", plot = plot)
+set.seed(123)
+LG_imputed <- impute_DIA4(data = DIA_NA, r_condition = r_condition, r_condrep = condrep, precursor = fg_id, intensity = normalised_intensity_log2)
+
+LG_imputed$missingness <- missingness_key[LG_imputed$fg_id,]
+
+plot <- qc_intensity_distribution(
+  data = LG_imputed,
+  grouping = fg_id,
+  intensity = normalised_intensity_imputed_log2,
+  plot_style = "histogram"
+)
+plot
+ggsave("Intensity_distribution_LG_imputed.pdf", plot = plot)
+
+```
+
+
+```{r imputing_values_vivi, message=FALSE, warning=FALSE}
+
+setwd(mainDir)
+
+DIA_raw_prot <- DIA_raw%>% filter(fg_ms2raw_quantity > 32) %>% filter(pep_is_proteotypic == TRUE)
+set.seed(123)
+vivi_imputed <- impute_vivi(data = DIA_raw_prot, sample = r_file_name, replicate = r_replicate, grouping = fg_id, condition = r_condition, treatment_condition = "Rapa_LiP", reference_condition = "DMSO_LiP", intensity = fg_ms2raw_quantity, cutoff_MAR = 3, cutoff_MNAR = 1, retain_columns = c("pep_is_proteotypic", "r_file_name")) %>% left_join(DIA_raw %>% distinct(pg_protein_accessions, pep_stripped_sequence, fg_id), 
+              by = c("fg_id"), relationship = "many-to-many")
+
+vivi_imputed_norm <- vivi_imputed %>%
+  mutate(intensity_log2 = log2(imputed_intensity))%>%
+  normalise(
+    sample = new_sample_id,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  )
+
+vivi_imputed_norm$condrep <- vivi_imputed_norm$new_sample_id
+
+
+plot <- qc_intensity_distribution(
+  data = vivi_imputed_norm,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  plot_style = "histogram"
+)
+
+plot
+ggsave("Intensity_distribution_vivi_imputed.pdf", plot = plot)
+
+```
+
+
+## Volcano plots precurser lvl
+
+
+```{r Volcano_plot_LG, message = FALSE, warning = FALSE}
+
+
+subDir <- "Volcano's"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+
+Volcano_input <- LG_imputed %>%
+  unique() %>%
+  assign_missingness(condrep,
+                     r_condition,
+                     fg_id,
+                     normalised_intensity_imputed_log2,
+                     ref_condition = "DMSO_LiP",
+                     retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+
+
+t_test_result_pre <- calculate_diff_abundance(data = Volcano_input,
+                                condrep,
+                                r_condition,
+                                fg_id,
+                                normalised_intensity_imputed_log2,
+                                missingness,
+                                comparison = comparison,
+                                ref_condition = "DMSO_LiP",
+                                method = "moderated_t-test",
+                                retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+
+
+
+
+
+condition_vulcano <- c("Rapa_LiP_vs_DMSO_LiP")
+t_test_result_proDA_pep_comp <- t_test_result_pre[t_test_result_pre$comparison %in% condition_vulcano, ]
+
+
+plot <- volcano_plot(t_test_result_proDA_pep_comp, fg_id, diff, adj_pval, method = "target", target_column = pg_protein_accessions, target = c("P62942") ,  x_axis_label = "log2(fold change) ", title = "Volcano plot peptide level", y_axis_label = "-log10(p-value)", log2FC_cutoff = 1, significance_cutoff = 0.01, interactive = F)
+
+plot
+ggsave("volcano_plot_LG_imputed.png", plot = plot)
+#volcano_plot(t_test_result_proDA_pep_comp, pep_grouping_key, diff, adj_pval, method = "target", target_column = pg_protein_accessions, target = c("P24941") ,  x_axis_label = "log2(fold change)", title = "Volcano plot precursor level", y_axis_label = "-log10(q-value)", log2FC_cutoff = 1, significance_cutoff = 0.05, interactive = T)
+
+
+pep_hits_LG <- subset(t_test_result_proDA_pep_comp, adj_pval < 0.01 & (diff < -1 | diff > 1))
+protein_hits_LG <- pep_hits_LG$pg_protein_accessions[!duplicated(pep_hits_LG$pg_protein_accessions)]
+
+
+
+```
+
+
+```{r Volcano_plot_vivi, message = FALSE, warning = FALSE}
+
+
+subDir <- "Volcano's"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+
+Volcano_input <- vivi_imputed_norm %>%
+  unique() %>%
+  assign_missingness(condrep,
+                     r_condition,
+                     fg_id,
+                     normalised_intensity_log2,
+                     ref_condition = "DMSO_LiP",
+                     retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+
+
+t_test_result_pre <- calculate_diff_abundance(data = Volcano_input,
+                                condrep,
+                                r_condition,
+                                fg_id,
+                                normalised_intensity_log2,
+                                missingness,
+                                comparison = comparison,
+                                ref_condition = "DMSO_LiP",
+                                method = "moderated_t-test",
+                                retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+
+
+
+
+
+condition_vulcano <- c("Rapa_LiP_vs_DMSO_LiP")
+t_test_result_proDA_pep_comp <- t_test_result_pre[t_test_result_pre$comparison %in% condition_vulcano, ]
+
+
+plot <- volcano_plot(t_test_result_proDA_pep_comp, fg_id, diff, adj_pval, method = "target", target_column = pg_protein_accessions, target = c("P62942") ,  x_axis_label = "log2(fold change) ", title = "Volcano plot peptide level", y_axis_label = "-log10(p-value)", log2FC_cutoff = 1, significance_cutoff = 0.01, interactive = F)
+
+plot
+ggsave("volcano_plot_vivi_imputed.png", plot = plot)
+#volcano_plot(t_test_result_proDA_pep_comp, pep_grouping_key, diff, adj_pval, method = "target", target_column = pg_protein_accessions, target = c("P24941") ,  x_axis_label = "log2(fold change)", title = "Volcano plot precursor level", y_axis_label = "-log10(q-value)", log2FC_cutoff = 1, significance_cutoff = 0.05, interactive = T)
+
+
+pep_hits_vivi <- subset(t_test_result_proDA_pep_comp, adj_pval < 0.01 & (diff < -1 | diff > 1))
+protein_hits_vivi <- pep_hits_vivi$pg_protein_accessions[!duplicated(pep_hits_vivi$pg_protein_accessions)]
+
+
+
+```
+
+```{r intensity across conditions profile plot as function, message=FALSE, warning=FALSE}
+#columns of data as variables not working for some reason
+profile_plot <- function(data, hits,dataset = "", intensity_log2 = "normalised_intensity_log2"){
+  #generate subset and group by stripped sequence and condition
+  for (p in 1:length(hits)){
+    subs <- subset(data, pg_protein_accessions == hits[p])
+    subs <-  arrange(subs,pep_stripped_sequence, r_condition)
+    
+    #get unique set of conditions and pep_stripped_sequences
+    conditions <- subs$condrep[!duplicated(subs$condrep)]
+    conditions <- str_sort(conditions)
+    sequences <- subs$pep_stripped_sequence[!duplicated(subs$pep_stripped_sequence)]
+    
+    
+    #generate matrix of zeros for the intensities
+    df <- data.frame()
+    for (i in 1:length(conditions)){
+      column = numeric(length(sequences))
+      df = rbind(df, column)
+    }
+    
+    colnames(df)<-sequences
+    rownames(df)<-conditions
+    df$condrep = conditions
+    #return(df)
+    #fill in data
+    #iterate over conditions
+    for (i in 1:length(conditions)){
+      #iterate over sequences
+      for (j in 1:length(sequences)){
+        #generate sub-subset containing only values for given condition and sequence (single value or list of duplicates)
+        x <- subset(subs, pep_stripped_sequence == sequences[j] & condrep == conditions[i])
+        #eliminate duplicate values and save in dataframe while adding up all fragments of peptide 
+         value <- log2(sum(2^(x$intensity_log2[!duplicated(x$intensity_log2)])))
+         #fix if there are no values - doesn't try to overwrite zero with empty value
+        if (length(value) > 0){
+          df[i,j] <- value
+        }
+      }
+    }
+    df_m <- melt(df)
+    
+    #sizing constant depending on size of legend
+    aspect = length(sequences)%/%15 * 0.35 + 0.65
+    plot <- ggplot(df, aes(condrep)) +
+      geom_line(data = df_m, aes(x=condrep, y=value, group = variable, colour = variable))+
+      scale_x_discrete(guide = guide_axis(angle = 90))+
+      xlab("Condition")+
+      ylab("Normalised Log2 Intensity")+
+      theme(legend.key.size = unit(0.832, "lines"))+
+      geom_point(data = df_m, aes(condrep, value))+
+      ggtitle(hits[p])
+    ggsave(filename = paste(dataset,paste(protein_hits[p], "profile_plot.png", sep = "_"),sep=""), height = 5, width = 7 * aspect,  plot = plot)
+  }
+}
+
+```
+
+```{r intensity across conditions profile plot vivi, message=FALSE, warning=FALSE}
+subDir <- "Vivi_profiles"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+profile_plot(vivi_imputed_norm, dataset = "vivi_",hits = protein_hits_vivi)
+
+
+
+```
+
+```{r intensity across conditions profile plot LG, message=FALSE, warning=FALSE}
+subDir <- "LG_profiles"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+profile_plot(LG_imputed, dataset = "LG_",hits = protein_hits_LG,intensity_log2 = "normalised_intensity_imputed_log2" )
+
+
+
+
+```
+
+```{r missingness as function of intesity, message=FALSE, warning=FALSE}
+
+
+
+
+boxplot(normalised_intensity_log2~missingness, data = missingness)
+
+```
