@@ -13,6 +13,7 @@ library(ggplot2)
 library(stringr)
 library(tidyr)
 library(reshape2)
+library(heatmaply)
 ```
 
 ## Loading data
@@ -40,7 +41,7 @@ if (file.exists(subDir)){
 
 mainDir <- file.path(mainDir, subDir)
 
-
+DIA_raw$condrep <- paste(DIA_raw$r_condition,DIA_raw$r_replicate, sep = "_")
 
 
 ```
@@ -61,7 +62,7 @@ DIA_raw_norm<- DIA_raw %>%
   filter(eg_is_decoy == FALSE) %>%
   mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
   normalise(
-    sample = r_sample,
+    sample = r_file_name,
     intensity_log2 = intensity_log2,
     method = "median"
   ) %>%
@@ -86,6 +87,8 @@ ggsave("Intensity_distribution_raw.pdf", plot = plot)
 
 
 ```{r LG_imputation_function, message=FALSE, warning=FALSE}
+#
+
 impute_MNAR <- function(n_missing, min, sd, rnk){
   	rnorm(n_missing, mean = min - log2(3), sd = sd)[rnk] }
 
@@ -94,29 +97,41 @@ impute_MAR <- function(n_missing, mean, sd, rnk){
 
 impute_DIA4 <- function(data, r_condition, r_condrep, precursor, intensity){
 	data_imputed <- data %>%
+	  #select columns condrep, condition, precursor, intensity
 		dplyr::select({{r_condrep}}, {{r_condition}}, {{precursor}}, {{intensity}})%>%
+	  #fill out missing combinations of precursor values
 		tidyr::complete({{precursor}}) %>%
+	  #non NA values arranged in descending orderm groups by condrep
 		dplyr::arrange(!is.na({{intensity}}), {{r_condrep}}) %>% 
-		group_by({{precursor}}, {{r_condition}})%>%
+		#calculate mean and standard deviation of intesity within each group (precursor and condition)
+	  group_by({{precursor}}, {{r_condition}})%>%
 		dplyr::mutate(mean = mean({{intensity}}, na.rm = TRUE)) %>%
 		dplyr::mutate(sd = sd({{intensity}}, na.rm = TRUE))%>%
+	  #count missing values
 		dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+	  #count replicates
 		dplyr::mutate(repl = dplyr::n())%>%
+	  #enumerator to select select value (ranks within each group)
 		dplyr::mutate(rnk = 1:dplyr::n())%>%
+	  #calculate minimum intensities per precursor
 		group_by({{precursor}})%>%
+	  #average across sd's of the conditions for new sd? 
 		dplyr::mutate(sd = mean(sd, na.rm = TRUE))%>%
+	  #minimum intensity per precursor
 		dplyr::mutate(min = min({{intensity}}, na.rm = TRUE))%>%
+	  #iterate over rows if intensity is NA imputes - if "all" or one replicate is missing imputes as MNAR, else if one replicate is missing impute MAR, if       not NA takes previous value - changed by me to include MAR definition 
 		rowwise() %>%
 		dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(is.na({{intensity}}), 	
-												ifelse(repl - missing == 0, impute_MNAR(missing, min, sd, rnk), 
-													impute_MAR(missing, mean, sd, rnk)), {{intensity}})) %>%
+												ifelse(repl - missing <= 0, impute_MNAR(missing, min, sd, rnk), 
+													ifelse(missing == 1, impute_MAR(missing, mean, sd, rnk), {{intensity}})), {{intensity}})) %>%
+	  #mark imputed values as such
 		dplyr::mutate(imputed = is.na({{intensity}}))%>%
 		dplyr::select({{r_condrep}}, {{precursor}}, normalised_intensity_imputed_log2, imputed)%>%
 		ungroup()
+	#join with imputed data with data
 	data %>%
 		left_join(data_imputed, by = c(as_label(enquo(r_condrep)), as_label(enquo(precursor))))
 }
-
 
 
 ```
@@ -126,40 +141,57 @@ impute_DIA4 <- function(data, r_condition, r_condrep, precursor, intensity){
 impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_condition, reference_condition, intensity, cutoff_MAR, cutoff_MNAR, retain_columns = NULL){
   
   data_complete <- data %>% 
+    #fitler out data neither in reference or treatment condition    
     filter( {{ condition }} %in% c(treatment_condition, reference_condition)) %>% 
+    #remoce duplicates (in case of grouping eg by peptides i guess)
     distinct( {{ grouping }}, {{ condition }}, {{ replicate }}, {{ intensity }} ) %>% 
+    #generate NA for missing values (by grouping, condition and replicate)
     complete( {{ grouping }}, {{ condition }},
               {{ replicate }}, fill = list(area = NA))
-  
+  #Imputing values
   result <- data %>%
+    #again filter out conditions not currently looked at
     filter( {{ condition }} %in% c(treatment_condition, reference_condition)) %>%
+    #remove duplicates
     distinct({{ condition }}, {{ grouping }}, {{ replicate }}) %>%
+    #group by condition and grouping (usually fg_id)
     group_by( {{ condition }},  {{ grouping }}) %>%
+    #generate column showing observations per group (excludes na values)
     mutate(n_observations = n()) %>%
     ungroup() %>%
+    #calculate missingness: complete as default, else overwritten with MAR or MNAR
     mutate(missingness = "complete") %>%
+    #if observations are below MAR cutoff - classified as MAR
     mutate(missingness = ifelse(n_observations < cutoff_MAR, "MAR", missingness)) %>%
+    #if observations are less or equal to MNAR cutoff, classified as MNAR
     mutate(missingness = ifelse(n_observations <= cutoff_MNAR, "MNAR", missingness)) %>%
+    #make sure distinct list of observations and missingness per condition and grouping (fg_id)
     distinct( {{ condition }},  {{ grouping }}, n_observations, missingness) %>%
+    #join to data complete by grouping (fg_id) and condition
     right_join(data_complete,
                by = c(rlang::as_name(rlang::enquo(condition)), rlang::as_name(rlang::enquo(grouping)))) %>%
+    #na values - observations set to 0 - else set to n_observations
     mutate(n_observations = ifelse(is.na(n_observations), 0, n_observations)) %>%
+    #if missingness is na - set to MNAR
     mutate(missingness = ifelse(is.na(missingness), "MNAR", missingness)) %>%
+    #create comparison column
     mutate(comparison = paste(treatment_condition, "vs", reference_condition, sep = "_")) %>%
     #mutate({{ condition }} = paste( {{ induction }},  {{ condition }}, sep = "_")) %>%
+    #add condrep as new_sample_id
     mutate(new_sample_id = paste({{ condition }}, {{ replicate }}, sep = "_")) %>%
+    #calculate means, sd's and min by condition and grouping
     group_by( {{ condition }},  {{ grouping }}) %>%
     mutate(mean = mean({{ intensity }}, na.rm = TRUE)) %>%
     mutate(sd = sd({{ intensity }}, na.rm = TRUE)) %>%
     mutate(min = min(mean)) %>%
     ungroup()
   
-  
+  #generate unique list of groupings (fg_id) with misisngness = complete
   complete_peptides <- result %>% 
     filter(missingness == "complete") %>% 
     pull({{ grouping }}) %>% 
     unique()
-  
+  #generate unique list of groupings with missingness = MNAR and that are not in the list with missingness = complete
   MNAR_peptides_to_remove <- result %>% 
     filter(missingness == "MNAR") %>% 
     filter(!{{ grouping }} %in% complete_peptides) %>% 
@@ -169,20 +201,28 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
   result <- result %>% 
     #filter(!{{ grouping }} %in% MNAR_peptides_to_remove) %>% 
     group_by({{ grouping }}) %>%
+    #calculate means, sd's and mins for the created NA values 
     mutate(mean = ifelse(is.na(mean), mean({{ intensity }}, na.rm = TRUE), mean)) %>% 
     mutate(sd = ifelse(is.na(sd), mean(sd, na.rm = TRUE), sd)) %>% 
     mutate(min = ifelse(is.na(min), min(mean), min)) %>% 
     ungroup() %>% 
+    #calculate mean for imputation if missingness is MNAR (minimum mean - 3)
     mutate(mean_calc = ifelse(missingness == "MNAR", min - 3, mean)) %>% 
     group_by(new_sample_id, {{ condition }}, {{ grouping }}, {{ intensity }}, missingness, comparison) %>% 
+    #impute missing values MNAR (min mean - 3 with calc sd)
     do(imputed_intensity = suppressWarnings(rnorm(1, mean = .$mean_calc, sd = .$sd))) %>% 
+    #replace NA values with imputed values
     mutate(imputed_intensity = ifelse(is.na({{ intensity }}), imputed_intensity, {{ intensity }})) %>% 
+    #filter out rows with intensity = na and missingness either complete or MAR
     filter(!(is.na({{ intensity }}) & missingness %in% c("complete", "MAR"))) %>% 
+    #filter out nan values
     filter(!(is.nan(imputed_intensity)))
 
   if (missing(retain_columns)) {
+    #if there is no value for retain_columns, return result
     return(result)
   } else {
+    #if retain_columns provided - join result with column from original data
     join_result <- data %>%
       dplyr::ungroup() %>%
       dplyr::select(!!enquo(retain_columns), colnames(result)[!colnames(result) %in% c("imputed_intensity", "missingness", "comparison", "new_sample_id")]) %>%
@@ -203,7 +243,7 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
 
 setwd(mainDir)
 
-DIA_raw_prot <- DIA_raw_norm%>%filter(normalised_intensity_log2 > 5) %>% filter(pep_is_proteotypic == TRUE)
+DIA_raw_prot <- DIA_raw_norm%>%filter(normalised_intensity_log2 > 10) %>% filter(pep_is_proteotypic == TRUE)
 
 #generate NA for missing values
 DIA_NA <- DIA_raw_prot %>% 
@@ -219,7 +259,7 @@ missingness <- DIA_raw_norm %>% assign_missingness(condrep,
                      fg_id,
                      normalised_intensity_log2,
                      ref_condition = "DMSO_LiP",
-                     retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+                     retain_columns = c(pg_protein_accessions, pep_stripped_sequence, eg_qvalue))
 
 
 #match fg_ids to accessions, peptide sequences and missingness
@@ -282,7 +322,7 @@ ggsave("Intensity_distribution_LG_imputed.pdf", plot = plot)
 
 setwd(mainDir)
 
-DIA_raw_prot <- DIA_raw%>% filter(fg_ms2raw_quantity > 32) %>% filter(pep_is_proteotypic == TRUE)
+DIA_raw_prot <- DIA_raw%>% filter(fg_ms2raw_quantity > 1000) %>% filter(pep_is_proteotypic == TRUE)
 set.seed(123)
 vivi_imputed <- impute_vivi(data = DIA_raw_prot, sample = r_file_name, replicate = r_replicate, grouping = fg_id, condition = r_condition, treatment_condition = "Rapa_LiP", reference_condition = "DMSO_LiP", intensity = fg_ms2raw_quantity, cutoff_MAR = 3, cutoff_MNAR = 1, retain_columns = c("pep_is_proteotypic", "r_file_name")) %>% left_join(DIA_raw %>% distinct(pg_protein_accessions, pep_stripped_sequence, fg_id), 
               by = c("fg_id"), relationship = "many-to-many")
@@ -481,7 +521,7 @@ profile_plot <- function(data, hits,dataset = "", intensity_log2 = "normalised_i
       theme(legend.key.size = unit(0.832, "lines"))+
       geom_point(data = df_m, aes(condrep, value))+
       ggtitle(hits[p])
-    ggsave(filename = paste(dataset,paste(protein_hits[p], "profile_plot.png", sep = "_"),sep=""), height = 5, width = 7 * aspect,  plot = plot)
+    ggsave(filename = paste(dataset,paste(hits[p], "profile_plot.png", sep = "_"),sep=""), height = 5, width = 7 * aspect,  plot = plot)
   }
 }
 
@@ -524,9 +564,65 @@ profile_plot(LG_imputed, dataset = "LG_",hits = protein_hits_LG,intensity_log2 =
 
 ```{r missingness as function of intesity, message=FALSE, warning=FALSE}
 
+subDir <- "main plots"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+missingness$missingness[is.na(missingness$missingness)] <- "neither"
+
+png(file ="boxplot_missingness_vs_intensity.png")
+plot <- boxplot(normalised_intensity_log2~missingness, data = missingness) 
+title("missingness vs intensity")
+#ggsave(filename = "boxplot_missingness_vs_intensity.png",  plot = plot)
+plot
+dev.off()
+
+png(file ="boxplot_missingness_vs_eg_qvalue.png")
+plot <- boxplot(eg_qvalue~missingness, data = missingness, ylim = c(0, 0.00015)) 
+title("missingness vs eg_qvalue")
+#ggsave(filename = "boxplot_missingness_vs_intensity.png",  plot = plot)
+plot
+dev.off()
+```
+```{r data completeness, message=FALSE, warning=FALSE}
+
+subDir <- "main plots"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+plot <- qc_data_completeness(
+  data = DIA_raw,
+  sample = r_file_name,
+  grouping = fg_id,
+  intensity = fg_ms2raw_quantity,
+  plot = TRUE
+)
+
+ggsave(filename = "data_completeness.png", plot = plot)
+
+plot
 
 
-
-boxplot(normalised_intensity_log2~missingness, data = missingness)
 
 ```
+
+```{r data completeness, message=FALSE, warning=FALSE}
+
+heatmaply(missingness,
+          xlab = "condrep",
+          ylab = "missingness")
+
+```
+
