@@ -160,8 +160,8 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
     #generate column showing observations per group (excludes na values)
     mutate(n_observations = n()) %>%
     ungroup() %>%
-    #calculate missingness: complete as default, else overwritten with MAR or MNAR
-    mutate(missingness = "complete") %>%
+    #calculate missingness: changed to make missingness "neither" as standard and "complete" if all are present 
+    mutate(missingness = ifelse(n_observations == length({{replicate}}[!duplicated({{replicate}})]), "complete", "neither")) %>%
     #if observations are below MAR cutoff - classified as MAR, i changed MAR classification to be n_observation == MAR - works but for more replicates would have to be changed to <=  but not complete
     mutate(missingness = ifelse(n_observations == cutoff_MAR, "MAR", missingness)) %>%
     #if observations are less or equal to MNAR cutoff, classified as MNAR
@@ -209,7 +209,7 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
     mutate(sd = ifelse(is.na(sd), mean(sd, na.rm = TRUE), sd)) %>% 
     mutate(min = ifelse(is.na(min), min(mean), min)) %>% 
     ungroup() %>% 
-    #calculate mean for imputation if missingness is MNAR (minimum mean - 3)
+    #calculate mean for imputation if missingness is MNAR (minimum mean - 3) 
     mutate(mean_calc = ifelse(missingness == "MNAR", min - 3, mean)) %>% 
     group_by(new_sample_id, {{ condition }}, {{ grouping }}, {{ intensity }}, missingness, comparison, imputed) %>% 
     #impute missing values MNAR (min mean - 3 with calc sd)
@@ -217,7 +217,7 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
     #replace NA values with imputed values
     mutate(imputed_intensity = ifelse(is.na({{ intensity }}), imputed_intensity, {{ intensity }})) %>% 
     #filter out rows with intensity = na and missingness either complete or MAR
-    filter(!(is.na({{ intensity }}) & missingness %in% c("complete", "MAR"))) %>% 
+    filter(!(is.na({{ intensity }}) & missingness %in% c("complete", "MAR","neither"))) %>% 
     #filter out nan values
     filter(!(is.nan(imputed_intensity)))
 
@@ -370,6 +370,7 @@ plot <- intensity_distribution_imputed(
 
 plot
 ggsave("Intensity_distribution_vivi_imputed.pdf", plot = plot)
+
 
 ```
 
