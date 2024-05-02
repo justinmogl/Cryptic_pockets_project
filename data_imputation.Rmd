@@ -148,6 +148,7 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
     #generate NA for missing values (by grouping, condition and replicate)
     complete( {{ grouping }}, {{ condition }},
               {{ replicate }}, fill = list(area = NA))
+    
   #Imputing values
   result <- data %>%
     #again filter out conditions not currently looked at
@@ -161,24 +162,26 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
     ungroup() %>%
     #calculate missingness: complete as default, else overwritten with MAR or MNAR
     mutate(missingness = "complete") %>%
-    #if observations are below MAR cutoff - classified as MAR
-    mutate(missingness = ifelse(n_observations < cutoff_MAR, "MAR", missingness)) %>%
+    #if observations are below MAR cutoff - classified as MAR, i changed MAR classification to be n_observation == MAR - works but for more replicates would have to be changed to <=  but not complete
+    mutate(missingness = ifelse(n_observations == cutoff_MAR, "MAR", missingness)) %>%
     #if observations are less or equal to MNAR cutoff, classified as MNAR
     mutate(missingness = ifelse(n_observations <= cutoff_MNAR, "MNAR", missingness)) %>%
     #make sure distinct list of observations and missingness per condition and grouping (fg_id)
     distinct( {{ condition }},  {{ grouping }}, n_observations, missingness) %>%
-    #join to data complete by grouping (fg_id) and condition
+    #join to data complete by grouping (fg_id) and condition - introduces na values to be imputed
     right_join(data_complete,
                by = c(rlang::as_name(rlang::enquo(condition)), rlang::as_name(rlang::enquo(grouping)))) %>%
     #na values - observations set to 0 - else set to n_observations
     mutate(n_observations = ifelse(is.na(n_observations), 0, n_observations)) %>%
-    #if missingness is na - set to MNAR
+    #if missingness is na - set to MNAR (values to be imputed)
     mutate(missingness = ifelse(is.na(missingness), "MNAR", missingness)) %>%
     #create comparison column
     mutate(comparison = paste(treatment_condition, "vs", reference_condition, sep = "_")) %>%
     #mutate({{ condition }} = paste( {{ induction }},  {{ condition }}, sep = "_")) %>%
     #add condrep as new_sample_id
     mutate(new_sample_id = paste({{ condition }}, {{ replicate }}, sep = "_")) %>%
+    #add imputed label (added by me for plotting)
+    mutate(imputed = ifelse(is.na({{ intensity }}), TRUE, FALSE))%>%
     #calculate means, sd's and min by condition and grouping
     group_by( {{ condition }},  {{ grouping }}) %>%
     mutate(mean = mean({{ intensity }}, na.rm = TRUE)) %>%
@@ -208,7 +211,7 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
     ungroup() %>% 
     #calculate mean for imputation if missingness is MNAR (minimum mean - 3)
     mutate(mean_calc = ifelse(missingness == "MNAR", min - 3, mean)) %>% 
-    group_by(new_sample_id, {{ condition }}, {{ grouping }}, {{ intensity }}, missingness, comparison) %>% 
+    group_by(new_sample_id, {{ condition }}, {{ grouping }}, {{ intensity }}, missingness, comparison, imputed) %>% 
     #impute missing values MNAR (min mean - 3 with calc sd)
     do(imputed_intensity = suppressWarnings(rnorm(1, mean = .$mean_calc, sd = .$sd))) %>% 
     #replace NA values with imputed values
@@ -225,9 +228,9 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
     #if retain_columns provided - join result with column from original data
     join_result <- data %>%
       dplyr::ungroup() %>%
-      dplyr::select(!!enquo(retain_columns), colnames(result)[!colnames(result) %in% c("imputed_intensity", "missingness", "comparison", "new_sample_id")]) %>%
+      dplyr::select(!!enquo(retain_columns), colnames(result)[!colnames(result) %in% c("imputed_intensity", "missingness", "comparison", "new_sample_id", "imputed")]) %>%
       dplyr::distinct() %>%
-      dplyr::right_join(result, by = colnames(result)[!colnames(result) %in% c("imputed_intensity", "missingness", "comparison", "new_sample_id")]) %>%
+      dplyr::right_join(result, by = colnames(result)[!colnames(result) %in% c("imputed_intensity", "missingness", "comparison", "new_sample_id", "imputed")]) %>%
       # Arrange by grouping but in a numeric order of the character vector.
       dplyr::arrange(factor({{ grouping }}, levels = unique(stringr::str_sort({{ grouping }}, numeric = TRUE))))
     
@@ -238,6 +241,32 @@ impute_vivi <- function(data, sample, replicate, grouping, condition, treatment_
 
 ```
 
+```{r intensity_distribution_plotting_imputed, message=FALSE, warning=FALSE}
+
+intensity_distribution_imputed <- function(data,grouping, intensity_log2, imputed) {
+  
+  plot <- data %>% ggplot2::ggplot(ggplot2::aes(x = {
+      {
+        intensity_log2
+      }
+    }, fill = 
+      
+        {{imputed}}
+      
+      )) + ggplot2::geom_histogram(binwidth = 0.5, color = "black") + 
+      ggplot2::labs(title = "Overall log2 Intensity Distribution", 
+      x = "Log2 Intensity", y = "Frequency") + 
+      ggplot2::theme_bw() + ggplot2::theme(plot.title = ggplot2::element_text(size = 20), 
+      axis.title.x = ggplot2::element_text(size = 15), 
+      axis.text.y = ggplot2::element_text(size = 15), 
+      axis.text.x = ggplot2::element_text(size = 12), 
+      axis.title.y = ggplot2::element_text(size = 15), 
+      strip.text = ggplot2::element_text(size = 15), strip.background = element_blank())
+    return(plot)
+  }
+
+
+```
 
 ```{r imputing_values_LG, message=FALSE, warning=FALSE}
 
@@ -288,7 +317,7 @@ missingness_key <-  get_missingness_keys(missingness)
 
 DIA_NA$pep_stripped_sequence[is.na(DIA_NA$pep_stripped_sequence)] <- pep_keys[DIA_NA$fg_id[is.na(DIA_NA$pep_stripped_sequence)],]
 DIA_NA$pg_protein_accessions[is.na(DIA_NA$pg_protein_accessions)] <- protein_keys[DIA_NA$fg_id[is.na(DIA_NA$pg_protein_accessions)],]
-
+DIA_NA$missingness <- missingness_key[DIA_NA$fg_id,]
 
 #add condrep
 DIA_NA$condrep <- paste(DIA_NA$r_condition, DIA_NA$r_replicate, sep = "_")
@@ -304,13 +333,13 @@ ggsave("Intensity_distribution_raw.pdf", plot = plot)
 set.seed(123)
 LG_imputed <- impute_DIA4(data = DIA_NA, r_condition = r_condition, r_condrep = condrep, precursor = fg_id, intensity = normalised_intensity_log2)
 
-LG_imputed$missingness <- missingness_key[LG_imputed$fg_id,]
 
-plot <- qc_intensity_distribution(
+
+plot <- intensity_distribution_imputed(
   data = LG_imputed,
   grouping = fg_id,
-  intensity = normalised_intensity_imputed_log2,
-  plot_style = "histogram"
+  intensity_log2 = normalised_intensity_imputed_log2,
+  imputed = imputed
 )
 plot
 ggsave("Intensity_distribution_LG_imputed.pdf", plot = plot)
@@ -322,27 +351,21 @@ ggsave("Intensity_distribution_LG_imputed.pdf", plot = plot)
 
 setwd(mainDir)
 
-DIA_raw_prot <- DIA_raw%>% filter(fg_ms2raw_quantity > 1000) %>% filter(pep_is_proteotypic == TRUE)
+DIA_raw_prot <- DIA_raw_norm%>%filter(normalised_intensity_log2 > 10) %>% filter(pep_is_proteotypic == TRUE)
 set.seed(123)
-vivi_imputed <- impute_vivi(data = DIA_raw_prot, sample = r_file_name, replicate = r_replicate, grouping = fg_id, condition = r_condition, treatment_condition = "Rapa_LiP", reference_condition = "DMSO_LiP", intensity = fg_ms2raw_quantity, cutoff_MAR = 3, cutoff_MNAR = 1, retain_columns = c("pep_is_proteotypic", "r_file_name")) %>% left_join(DIA_raw %>% distinct(pg_protein_accessions, pep_stripped_sequence, fg_id), 
+vivi_imputed <- impute_vivi(data = DIA_raw_prot, sample = r_file_name, replicate = r_replicate, grouping = fg_id, condition = r_condition, treatment_condition = "Rapa_LiP", reference_condition = "DMSO_LiP", intensity = normalised_intensity_log2, cutoff_MAR = 3, cutoff_MNAR = 1, retain_columns = c("pep_is_proteotypic", "r_file_name")) %>% left_join(DIA_raw %>% distinct(pg_protein_accessions, pep_stripped_sequence, fg_id), 
               by = c("fg_id"), relationship = "many-to-many")
 
-vivi_imputed_norm <- vivi_imputed %>%
-  mutate(intensity_log2 = log2(imputed_intensity))%>%
-  normalise(
-    sample = new_sample_id,
-    intensity_log2 = intensity_log2,
-    method = "median"
-  )
-
-vivi_imputed_norm$condrep <- vivi_imputed_norm$new_sample_id
 
 
-plot <- qc_intensity_distribution(
-  data = vivi_imputed_norm,
+vivi_imputed$condrep <- vivi_imputed$new_sample_id
+
+
+plot <- intensity_distribution_imputed(
+  data = vivi_imputed,
   grouping = fg_id,
-  intensity = normalised_intensity_log2,
-  plot_style = "histogram"
+  intensity = imputed_intensity,
+  imputed = imputed
 )
 
 plot
@@ -574,21 +597,60 @@ if (file.exists(subDir)){
     
 }
 
+#missingness for clean data
+missingness <- DIA_raw_norm %>% assign_missingness(condrep,
+                     r_condition,
+                     fg_id,
+                     normalised_intensity_log2,
+                     ref_condition = "DMSO_LiP",
+                     retain_columns = c(pg_protein_accessions, pep_stripped_sequence, eg_qvalue))
+
 missingness$missingness[is.na(missingness$missingness)] <- "neither"
 
-png(file ="boxplot_missingness_vs_intensity.png")
-plot <- boxplot(normalised_intensity_log2~missingness, data = missingness) 
+png(file ="boxplot_missingness_vs_intensity_clean.png")
+plot <- boxplot(normalised_intensity_log2~missingness, data = missingness, ylim= c(5,25)) 
 title("missingness vs intensity")
 #ggsave(filename = "boxplot_missingness_vs_intensity.png",  plot = plot)
 plot
 dev.off()
 
-png(file ="boxplot_missingness_vs_eg_qvalue.png")
+png(file ="boxplot_missingness_vs_eg_qvalue_clean.png")
 plot <- boxplot(eg_qvalue~missingness, data = missingness, ylim = c(0, 0.00015)) 
 title("missingness vs eg_qvalue")
 #ggsave(filename = "boxplot_missingness_vs_intensity.png",  plot = plot)
 plot
 dev.off()
+
+#assign missingness to raw data
+missingness_raw <- DIA_raw %>% assign_missingness(condrep,
+                     r_condition,
+                     fg_id,
+                     fg_ms2raw_quantity,
+                     ref_condition = "DMSO_LiP",
+                     retain_columns = c(pg_protein_accessions, pep_stripped_sequence, eg_qvalue, eg_is_decoy, pep_is_proteotypic))
+
+missingness_raw$missingness[is.na(missingness_raw$missingness)] <- "neither"
+
+missingness_raw<- missingness_raw %>%
+  filter(eg_is_decoy == FALSE) %>%
+  mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
+  filter(pep_is_proteotypic == TRUE)
+
+
+png(file ="boxplot_missingness_vs_intensity_raw.png")
+plot <- boxplot(intensity_log2~missingness, data = missingness_raw, ylim= c(5,25)) 
+title("missingness vs intensity")
+#ggsave(filename = "boxplot_missingness_vs_intensity.png",  plot = plot)
+plot
+dev.off()
+
+png(file ="boxplot_missingness_vs_eg_qvalue_raw.png")
+plot <- boxplot(eg_qvalue~missingness, data = missingness_raw, ylim = c(0, 0.00015)) 
+title("missingness vs eg_qvalue")
+#ggsave(filename = "boxplot_missingness_vs_intensity.png",  plot = plot)
+plot
+dev.off()
+
 ```
 ```{r data completeness, message=FALSE, warning=FALSE}
 
