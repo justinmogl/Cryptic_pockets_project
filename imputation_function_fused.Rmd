@@ -1,0 +1,269 @@
+````{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Preperation
+
+## Loading packages 
+
+```{r loading_packages, message=FALSE, warning=FALSE}
+library(protti)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+library(reshape2)
+library(heatmaply)
+```
+
+## Loading data
+
+
+```{r loading_data, message=FALSE, warning=FALSE}
+
+working_directory = "Z:/jumogl/JM002_LiPSchool/Spectronaut output"
+file_name = "20240321_153536_20240320093116_Report.csv"
+
+setwd(working_directory)
+
+DIA_raw <- read_protti(file_name)
+
+mainDir <- working_directory
+subDir <- "Plots_Imputation"
+
+if (file.exists(subDir)){
+  setwd(file.path(mainDir, subDir))
+} else {
+  dir.create(file.path(mainDir, subDir))
+  setwd(file.path(mainDir, subDir))
+  
+}
+
+mainDir <- file.path(mainDir, subDir)
+
+DIA_raw$condrep <- paste(DIA_raw$r_condition,DIA_raw$r_replicate, sep = "_")
+
+
+```
+
+
+
+```{r cleaning_data, message=FALSE, warning=FALSE}
+
+subDir <- "QC"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+DIA_raw_norm<- DIA_raw %>%
+  filter(eg_is_decoy == FALSE) %>%
+  mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
+  normalise(
+    sample = r_file_name,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  ) %>%
+  filter(pep_is_proteotypic == TRUE)%>%
+  filter(fg_ms2raw_quantity > 32)
+
+
+plot <- qc_intensity_distribution(
+  data = DIA_raw_norm,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  plot_style = "histogram"
+)
+plot
+ggsave("Intensity_distribution_raw.pdf", plot = plot)
+
+
+
+```
+
+
+#define functions
+```{r imputation_function_fused, message=FALSE, warning=FALSE}
+ get_keys <- function(data, group, x){
+    df <- data %>% distinct({{group}}, .keep_all = TRUE)
+    group <- df%>%pull({{group}})
+    x <- df%>% pull({{x}})
+    keys <- data.frame(row.names= group, val=x)
+    return (keys)
+  }
+
+
+
+DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imputation_MNAR = "LG", imputation_MAR = "LG", r_condition = r_condition, r_condrep = condrep, precursor = fg_id, intensity = normalised_intensity_log2, prot_acc = pg_protein_accessions, pep_sequences = pep_stripped_sequence, r_replicate = r_replicate, percent_cutoff_MNAR = 30, percent_cutoff_MAR = 70){
+  #define imputation methods - set to LG as default
+  if ({{imputation_MNAR}} == "LG"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      rnorm(n_missing, mean = min - log2(3), sd = sd)[rnk] }
+  }
+  if ({{imputation_MNAR}} == "VR"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      rnorm(n_missing, mean = min - 3, sd = sd)[rnk] }
+  }
+  if ({{imputation_MNAR}} == "none"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      return(NA)}
+  }
+  if ({{imputation_MAR}} == "LG"){  
+    impute_MAR <- function(n_missing, mean, sd, rnk){
+      rnorm(n_missing, mean = mean, sd = sd)[rnk] }
+  }
+  if ({{imputation_MAR}} == "none"){
+    impute_MAR <- function(n_missing, mean, sd, rnk){
+      return(NA)}
+  }
+  
+  #calculate cutoffs from percentage values
+  r = nrow(data%>%dplyr::distinct({{r_replicate}}))
+  cutoff_MNAR = (r * percent_cutoff_MNAR) %/% 100
+  cutoff_MAR = r - ((r*(100-percent_cutoff_MAR))%/%100)
+  
+  #fetch values you want not to be NA for imputed values - using pep_stripped_sequence and pg_protein_accessions as those may be interesing for graphing
+  peps <- get_keys(data, group = {{precursor}}, x = {{pep_sequences}})
+  prots <- get_keys(data, group = {{precursor}}, x = {{prot_acc}})
+  #complete dataframe with NA values to impute - fill in values for pep_stripped_sequence and pg_protein_accessions from "keys"
+  data_NA <- data %>%
+    dplyr::distinct( {{precursor}}, {{r_condition}}, {{r_replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    tidyr::complete( {{precursor}}, {{r_condition}}, {{r_replicate}}, fill = list(area = NA))%>%
+    dplyr::mutate(pep_stripped_sequence = ifelse(is.na({{pep_sequences}}), peps[{{precursor}},], {{pep_sequences}}))%>%
+    dplyr::mutate(pg_protein_accessions = ifelse(is.na({{prot_acc}}), prots[{{precursor}},], {{prot_acc}}))%>%
+    dplyr::mutate(condrep = ifelse(is.na(condrep), paste({{r_condition}}, {{r_replicate}}, sep = "_"), condrep))
+  
+  data_imputed <- data_NA %>%
+    #select columns condrep, condition, precursor, intensity
+    dplyr::select({{r_condrep}}, {{r_condition}}, {{precursor}}, {{intensity}})%>%
+    #fill out missing combinations of precursor values
+    tidyr::complete({{precursor}}) %>%
+    #non NA values arranged in descending order groups by condrep
+    dplyr::arrange(!is.na({{intensity}}), {{r_condrep}}) %>% 
+    #calculate mean and standard deviation of intesity within each group (precursor and condition)
+    group_by({{precursor}}, {{r_condition}})%>%
+    dplyr::mutate(mean = mean({{intensity}}, na.rm = TRUE)) %>%
+    dplyr::mutate(sd = sd({{intensity}}, na.rm = TRUE))%>%
+    #count missing values
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    #count replicates
+    dplyr::mutate(repl = dplyr::n())%>%
+    #enumerator to select select value (ranks within each group)
+    dplyr::mutate(rnk = 1:dplyr::n())%>%
+    #assing missingness added by me
+    rowwise()%>%
+    dplyr::mutate(missingness = "neither")%>%
+    dplyr::mutate(missingness = ifelse(repl - missing <= cutoff_MNAR, "MNAR", 
+                                       ifelse(missing == 0, "complete", ifelse(repl - missing >= cutoff_MAR, "MAR", missingness))))%>%
+    #remove mean values that shouldn't be imputed on (e.g.imputation reference not MAR or complete) - can be changed, only imputes from MAR and complete as default
+    dplyr::mutate(mean = ifelse(missingness %in% imputation_reference, mean, NA))%>%
+    group_by({{precursor}})%>%
+    #mean across sd's of the conditions for new sd 
+    dplyr::mutate(sd = mean(sd, na.rm = TRUE))%>%
+    #add skip value (by me)  - if all mean values are NA in both conditions creates errors in min and rnorm functions
+    dplyr::mutate(skip = all(is.na(mean)))%>%
+    #minimum intensity per precursor, if all NA will return inf - ifelse statement as bugfix: to avoid imputation where "imputation reference" is "neither" or "MNAR" the skip boolean was added 
+    dplyr::mutate(min = ifelse(skip, NA, min(mean, na.rm = TRUE)))%>%
+    #iterate over rows if intensity is NA imputes - if "all" or one replicate is missing imputes as MNAR, else if one replicate is missing impute MAR, if       not NA takes intesity_log2 - changed by me to include MAR definition, changed cutoffs from numerical values to variable
+    rowwise() %>%
+    dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(skip, NA, ifelse(is.na({{intensity}}), 	
+                                                             ifelse(missingness == "MNAR", impute_MNAR(missing, min, sd, rnk), 
+                                                                    ifelse(missingness == "MAR", impute_MAR(missing, mean, sd, rnk), {{intensity}})), {{intensity}}))) %>%
+    #mark imputed values as such
+    dplyr::mutate(imputed = is.na({{intensity}}))%>%
+    dplyr::select({{r_condrep}}, {{precursor}}, normalised_intensity_imputed_log2, imputed, missingness)%>%
+    ungroup()
+  #join with imputed data with data
+  data_NA %>%
+    left_join(data_imputed, by = c(as_label(enquo(r_condrep)), as_label(enquo(precursor))))%>%
+    #filter out nan values
+    dplyr:: filter(!(is.na(normalised_intensity_imputed_log2)))
+} 
+
+
+```
+
+```{r intensity_plotting_imputed, message=FALSE, warning=FALSE}
+
+intensity_distribution_imputed <- function(data,grouping, intensity_log2, imputed) {
+  
+  plot <- data %>% ggplot2::ggplot(ggplot2::aes(x = {
+      {
+        intensity_log2
+      }
+    }, fill = 
+      
+        {{imputed}}
+      
+      )) + ggplot2::geom_histogram(binwidth = 0.5, color = "black") + 
+      ggplot2::labs(title = "Overall log2 Intensity Distribution", 
+      x = "Log2 Intensity", y = "Frequency") + 
+      ggplot2::theme_bw() + ggplot2::theme(plot.title = ggplot2::element_text(size = 20), 
+      axis.title.x = ggplot2::element_text(size = 15), 
+      axis.text.y = ggplot2::element_text(size = 15), 
+      axis.text.x = ggplot2::element_text(size = 12), 
+      axis.title.y = ggplot2::element_text(size = 15), 
+      strip.text = ggplot2::element_text(size = 15), strip.background = element_blank())
+    return(plot)
+  }
+
+
+intensity_distribution_missingness <- function(data,grouping, intensity_log2, missingness) {
+  
+  plot <- data %>% ggplot2::ggplot(ggplot2::aes(x = {
+      {
+        intensity_log2
+      }
+    }, fill = 
+      
+        {{missingness}}
+      
+      )) + ggplot2::geom_histogram(binwidth = 0.5, color = "black") + 
+      ggplot2::labs(title = "Overall log2 Intensity Distribution", 
+      x = "Log2 Intensity", y = "Frequency") + 
+      ggplot2::theme_bw() + ggplot2::theme(plot.title = ggplot2::element_text(size = 20), 
+      axis.title.x = ggplot2::element_text(size = 15), 
+      axis.text.y = ggplot2::element_text(size = 15), 
+      axis.text.x = ggplot2::element_text(size = 12), 
+      axis.title.y = ggplot2::element_text(size = 15), 
+      strip.text = ggplot2::element_text(size = 15), strip.background = element_blank())
+    return(plot)
+  }
+
+
+
+
+```
+
+```{r imputing_values, message=FALSE, warning=FALSE}
+
+setwd(mainDir)
+
+set.seed(123)
+imputed <- DIA_imputation(DIA_raw_norm)
+
+plot <- intensity_distribution_imputed(
+  data = imputed,
+  grouping = fg_id,
+  intensity = normalised_intensity_imputed_log2,
+  imputed = imputed
+)
+
+plot
+ggsave("Intensity_distribution_imputed.pdf", plot = plot)
+
+plot <- intensity_distribution_missingness(
+  data = imputed,
+  grouping = fg_id,
+  intensity = normalised_intensity_imputed_log2,
+  missingness = missingness
+)
+
+plot
+ggsave("Intensity_distribution_missingness.pdf", plot = plot)
+
+```
