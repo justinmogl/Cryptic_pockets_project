@@ -21,8 +21,8 @@ library(heatmaply)
 
 ```{r loading_data, message=FALSE, warning=FALSE}
 
-working_directory = "Z:/jumogl/JM002_LiPSchool/Spectronaut output"
-file_name = "20240321_153536_20240320093116_Report.csv"
+working_directory = "Z:/jumogl/JM003_AT222/Spectronaut output"
+file_name = "20240411_162202_20240407072240_Report_Eclipse_MD.csv"
 
 setwd(working_directory)
 
@@ -108,6 +108,10 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
     impute_MNAR <- function(n_missing, min, sd, rnk){
       rnorm(n_missing, mean = min - 3, sd = sd)[rnk] }
   }
+   if ({{imputation_MNAR}} == "TS"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      rnorm(n_missing, mean = min - log2(5), sd = sd)[rnk] }
+   }
   if ({{imputation_MNAR}} == "none"){
     impute_MNAR <- function(n_missing, min, sd, rnk){
       return(NA)}
@@ -170,9 +174,9 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
     dplyr::mutate(min = ifelse(skip, NA, min(mean, na.rm = TRUE)))%>%
     #iterate over rows if intensity is NA imputes - if "all" or one replicate is missing imputes as MNAR, else if one replicate is missing impute MAR, if       not NA takes intesity_log2 - changed by me to include MAR definition, changed cutoffs from numerical values to variable
     rowwise() %>%
-    dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(skip, NA, ifelse(is.na({{intensity}}), 	
+   dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(is.na({{intensity}}),ifelse(skip, NA, 	
                                                              ifelse(missingness == "MNAR", impute_MNAR(missing, min, sd, rnk), 
-                                                                    ifelse(missingness == "MAR", impute_MAR(missing, mean, sd, rnk), {{intensity}})), {{intensity}}))) %>%
+                                                                    ifelse(missingness == "MAR", impute_MAR(missing, mean, sd, rnk), {{intensity}}))), {{intensity}})) %>%
     #mark imputed values as such
     dplyr::mutate(imputed = is.na({{intensity}}))%>%
     dplyr::select({{r_condrep}}, {{precursor}}, normalised_intensity_imputed_log2, imputed, missingness)%>%
@@ -265,5 +269,99 @@ plot <- intensity_distribution_missingness(
 
 plot
 ggsave("Intensity_distribution_missingness.pdf", plot = plot)
+
+```
+
+```{r kernel_density_estimation, message=FALSE, warning=FALSE}
+setwd(mainDir)
+
+plot <- ggplot(aes(x= normalised_intensity_imputed_log2, colour = missingness), data = imputed) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_imputed")
+
+plot
+ggsave("KDE_imputed.pdf", plot = plot)
+
+plot <- ggplot(aes(x= normalised_intensity_log2, colour = missingness), data = imputed) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_non-imputed")
+
+plot
+ggsave("KDE_non-imputed.pdf", plot = plot)
+```
+
+
+```{r kernel_density_estimation, message=FALSE, warning=FALSE}
+setwd(mainDir)
+
+plot <- imputed%>%filter(imputed == FALSE)%>%count(missingness = factor(missingness))%>%mutate(pct = prop.table(n))%>%ggplot(aes(x = missingness, y=pct, label = scales::percent(pct))) + geom_col(position = 'dodge') + geom_text(position = position_dodge(width = .9),    # move to center of bars
+              vjust = -0.5,    # nudge above top of bar
+              size = 3) + 
+    scale_y_continuous(labels = scales::percent)+
+    ggtitle("missingness_percentages_non-imputed")
+plot
+ggsave("missingness_percentages_non-imputed.pdf", plot = plot)
+
+plot <- imputed%>%count(missingness = factor(missingness))%>%mutate(pct = prop.table(n))%>%ggplot(aes(x = missingness, y=pct, label = scales::percent(pct))) + geom_col(position = 'dodge') + geom_text(position = position_dodge(width = .9),    # move to center of bars
+              vjust = -0.5,    # nudge above top of bar
+              size = 3) + 
+    scale_y_continuous(labels = scales::percent)+
+    ggtitle("missingness_percentages_imputed")
+plot
+ggsave("missingness_percentages_imputed.pdf", plot = plot)
+
+```
+
+
+
+```{r data completeness, message=FALSE, warning=FALSE}
+
+subDir <- "main plots"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+plot <- qc_data_completeness(
+  data = DIA_raw,
+  sample = condrep,
+  grouping = fg_id,
+  intensity = fg_ms2raw_quantity,
+  plot = TRUE
+)
+
+ggsave(filename = "data_completeness_raw.png", plot = plot)
+
+plot
+
+plot <- qc_data_completeness(
+  data = DIA_raw_norm,
+  sample = condrep,
+  grouping = fg_id,
+  intensity = fg_ms2raw_quantity,
+  plot = TRUE
+)
+
+ggsave(filename = "data_completeness_clean.png", plot = plot)
+
+plot
+
+plot <- qc_data_completeness(
+  data = imputed,
+  sample = condrep,
+  grouping = fg_id,
+  intensity = normalised_intensity_imputed_log2,
+  plot = TRUE
+)
+
+ggsave(filename = "data_completeness_imputed.png", plot = plot)
+
+plot
 
 ```
