@@ -1,0 +1,867 @@
+````{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Preperation
+
+## Loading packages 
+
+```{r loading_packages, message=FALSE, warning=FALSE}
+library(protti)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(tidyr)
+library(imp4p)
+library(reshape2)
+```
+
+
+```{r loading_data, message=FALSE, warning=FALSE}
+
+working_directory = "Z:/jumogl/JM002_LiPSchool/Spectronaut output"
+file_name = "20240322_103909_240319_Tryptic_control_Report.csv"
+
+#set working directory
+setwd(working_directory)
+
+#read data
+DIA_raw <- read_protti(file_name)
+
+#define subdirectory 
+mainDir <- working_directory
+subDir <- "Plots_data_deletion"
+#create subdurectory if doesn't exist, else set subdirectory as working directory
+if (file.exists(subDir)){
+  setwd(file.path(mainDir, subDir))
+} else {
+  dir.create(file.path(mainDir, subDir))
+  setwd(file.path(mainDir, subDir))
+  
+}
+
+#change maindirectory to subdirectory - for later defining of further subdirectories
+mainDir <- file.path(mainDir, subDir)
+
+#define grouping variable for condition and replicate
+DIA_raw$condrep <- paste(DIA_raw$r_condition,DIA_raw$r_replicate, sep = "_")
+
+
+```
+
+
+
+```{r cleaning_data, message=FALSE, warning=FALSE}
+
+#quality control subdirectory for data filtering plots - create and set as working directory
+subDir <- "QC"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+#min filtered data for MNAR groundtruth intensity 
+DIA_raw_Minimal_filtered <- DIA_raw%>%
+  filter(eg_is_decoy == FALSE) %>%
+  mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
+  normalise(
+    sample = r_file_name,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  ) %>%
+  filter(pep_is_proteotypic == "TRUE")%>%
+  filter(normalised_intensity_log2 > 4)
+
+#regular normalised filtered data 
+DIA_raw_norm<- DIA_raw %>%
+  filter(eg_is_decoy == FALSE) %>%
+  mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
+  normalise(
+    sample = r_file_name,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  ) %>%
+  filter(pep_is_proteotypic == "TRUE")%>%
+  filter(normalised_intensity_log2 > 10)
+
+#plots intensity of normalised filtered data
+plot <- qc_intensity_distribution(
+  data = DIA_raw_norm,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  plot_style = "histogram"
+)
+plot
+ggsave("Intensity_distribution_raw.pdf", plot = plot)
+
+
+
+```
+
+
+```{r functions, message=FALSE, warning=FALSE}
+
+#function fetches values for an identifying variable - eg get missingness classification of a given precursor and condition from filtered data to apply to minimal filtered data
+get_keys <- function(data, group, x){
+    df <- data %>% distinct({{group}}, .keep_all = TRUE)
+    group <- df%>%pull({{group}})
+    x <- df%>% pull({{x}})
+    keys <- data.frame(row.names= group, val=x)
+    return (keys)
+}
+#missingness assignment with NA values
+missingness <- function(data = data_clean, precursor = precursor, condition = condition, intensity = intensity, replicate = r_replicate, percent_cutoff_MNAR= percent_cutoff_MNAR, percent_cutoff_MAR=percent_cutoff_MAR){
+  #fetch number of replicates
+  r = nrow(data%>%dplyr::distinct({{replicate}}))
+  #caluculate replicate cutoffs from percentage cutoffs
+  cutoff_MNAR = (r * percent_cutoff_MNAR) %/% 100
+  cutoff_MAR = r - ((r*(100-percent_cutoff_MAR))%/%100)
+  
+  #generate complete dataset with NA values
+  data_NA <- data %>%
+    #creates distinct list for grouping variables of precrsor, condition, replicate and intensity - irrelevant unless upscaling to peptide level
+    dplyr::distinct( {{precursor}}, {{condition}}, {{replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    #completes sets of precursor condition and replicate - missing replicates completed with NA values 
+    tidyr::complete( {{precursor}}, {{condition}}, {{replicate}}, fill = list(area = NA))%>%
+    #count missing values
+    group_by({{precursor}}, {{condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    #define missingness by number of missing replicates
+    rowwise()%>%
+    #neither condition as default
+    dplyr::mutate(missingness = "neither")%>%
+    #number of replicates below cutof MNAR - MNAR; if no missing - complete, if above cutoff MAR and not complete - MAR, else neither
+    dplyr::mutate(missingness = ifelse(r - missing <= cutoff_MNAR, "MNAR", 
+                                       ifelse(missing == 0, "complete", ifelse(r - missing >= cutoff_MAR, "MAR", missingness))))%>%
+    #define grouping variable of precursor and condition to apply missingness to other datasets
+    ungroup()%>%
+    dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))
+  return(data_NA)
+}
+#calculates density distribution for MAR and MNAR for random draws
+calculate_densities <- function(data_clean = DIA_raw_norm, data_raw = DIA_raw_Minimal_filtered, precursor = fg_id, condition = r_condition, intensity = normalised_intensity_log2, r_replicate = r_replicate, percent_cutoff_MNAR = 30, percent_cutoff_MAR = 70){
+  
+  #get completed NA dataset with missingness classification per precorsor and condition
+  data_NA <- missingness(data = data_clean, precursor = {{precursor}}, condition = {{condition}}, intensity = {{intensity}}, replicate = {{r_replicate}}, percent_cutoff_MNAR= percent_cutoff_MNAR, percent_cutoff_MAR=percent_cutoff_MAR)
+  
+  #get missingness by precursor and condition from NA dataset to apply to unfiltered dataset
+  miss_keys <- get_keys(data_NA, group = precond, x = missingness)
+  
+  #Missingness classification from filtered data applied to minimal filtered data
+  data <- data_raw%>%dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))%>%dplyr::mutate(missingness =  miss_keys[precond,])
+  #get a distinct list of missingness calssifications to iterate over
+  missingness <- data%>%distinct(missingness)%>%arrange(missingness)
+  #remove NA values - precorsors present in unfiltered but not present in filtered data 
+  missing_v <- na.omit(missingness[[1]])
+  #Fit density distributions for each missingness classification - save in densities list
+  densities <- list()
+  for (i in 1:length(missing_v)){
+    values <- data%>%filter(missingness == missing_v[i])%>%select({{intensity}})
+    densities <- append(densities,list(density(values[[1]])))
+    densities[[i]][["data.name"]] <- missing_v[i]
+    densities[[i]][["fragments"]] <- data%>%filter(missingness == missing_v[i])%>%distinct(fg_id)%>%nrow()
+  }
+  return(densities)
+}
+
+#marks precond that are complete - for generating synthetic missing values 
+mark_completes <- function(data = DIA_raw_Minimal_filtered, precursor =fg_id, condition = r_condition, intensity = normalised_intensity_log2, replicate = r_replicate){
+  data <- data.frame(data)
+  #create fill out missings with NA values
+  data_NA <- data %>%
+    dplyr::distinct({{precursor}}, {{condition}}, {{replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    tidyr::complete({{precursor}}, {{condition}}, {{replicate}}, fill = list(area = NA))%>%
+    #count missing values
+    group_by({{precursor}}, {{condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    #label complete precursors and replicates
+    rowwise()%>%
+    mutate(is_complete = ifelse(missing == 0, TRUE, FALSE))%>%
+    #filter out na values - missings
+    filter(!is.na(precondrep))
+  #keys of complete boolean grouped by precursor conditions and replicates
+  complete_keys <- get_keys(data_NA, precondrep, is_complete)
+  #apply complete boolean to dataset
+  data_complete <- data%>%mutate(is_complete = complete_keys[precondrep,])
+  return(data_complete)
+}
+
+
+#get missingness keys by precond 
+get_miss_keys_clean <- function(data_clean = DIA_raw_norm, data_raw = DIA_raw_Minimal_filtered, precursor = fg_id, condition = r_condition, intensity = normalised_intensity_log2, r_replicate = r_replicate, percent_cutoff_MNAR = 30, percent_cutoff_MAR = 70){
+  
+  #fetch number of replicates
+  r = nrow(data_clean%>%dplyr::distinct({{r_replicate}}))
+  #calculate repicate cutoffs from precentage cutoffs
+  cutoff_MNAR = (r * percent_cutoff_MNAR) %/% 100
+  cutoff_MAR = r - ((r*(100-percent_cutoff_MAR))%/%100)
+  
+  #complete missings with NAs
+  data_NA <- data_clean %>%
+    dplyr::distinct( {{precursor}}, {{condition}}, {{r_replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    tidyr::complete( {{precursor}}, {{condition}}, {{r_replicate}}, fill = list(area = NA))%>%
+    #count missing values
+    group_by({{precursor}}, {{condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    #classify misisngness as in "missingness()" function
+    rowwise()%>%
+    dplyr::mutate(missingness = "neither")%>%
+    dplyr::mutate(missingness = ifelse(r - missing <= cutoff_MNAR, "MNAR", 
+                                       ifelse(missing == 0, "complete", ifelse(r - missing >= cutoff_MAR, "MAR", missingness))))%>%
+    #define grouping variable of precursor and condition to apply missingness to other datasets
+    ungroup()%>%
+    dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))
+  #get missingness keys to return
+  miss_keys <- get_keys(data_NA, group = precond, x = missingness)
+  return(miss_keys)
+}
+#imputation function
+DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), neither_assignment = "none", imputation_MNAR = "LG", imputation_MAR = "LG", r_condition = r_condition, r_condrep = condrep, precursor = fg_id, intensity = normalised_intensity_log2, prot_acc = pg_protein_accessions, pep_sequences = pep_stripped_sequence, r_replicate = r_replicate, percent_cutoff_MNAR = 30, percent_cutoff_MAR = 70){
+  #define imputation methods - set to LG as default
+  if ({{imputation_MNAR}} == "LG"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      rnorm(n_missing, mean = min - log2(3), sd = sd)[rnk] }
+  }
+  if ({{imputation_MNAR}} == "VR"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      rnorm(n_missing, mean = min - 3, sd = sd)[rnk] }
+  }
+  if ({{imputation_MNAR}} == "TS"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      rnorm(n_missing, mean = min - log2(5), sd = sd)[rnk] }
+  }
+  if ({{imputation_MNAR}} == "none"){
+    impute_MNAR <- function(n_missing, min, sd, rnk){
+      return(NA)}
+  }
+  if ({{imputation_MAR}} == "LG"){  
+    impute_MAR <- function(n_missing, mean, sd, rnk){
+      rnorm(n_missing, mean = mean, sd = sd)[rnk] }
+  }
+  if ({{imputation_MAR}} == "none"){
+    impute_MAR <- function(n_missing, mean, sd, rnk){
+      return(NA)}
+  }
+  if (neither_assignment == "MLE"){
+    assign_neither <- function(mean, r, cutoff_MAR, cutoff_MNAR){
+      x = 0
+      for(i in 1:(cutoff_MNAR+1)){
+        #print(densities[[i]][["data.name"]])
+        b = ((approx(densities[[i]][["x"]], densities[[i]][["y"]], xout = {{mean}})$y)*(densities[[i]][["n"]]/densities[[i]][["fragments"]]))
+        x = x - ifelse(is.na(b), 0, b)
+      }
+      for (i in (cutoff_MAR+1):(r+1)){
+        #print(densities[[i]][["data.name"]])
+        b = ((approx(densities[[i]][["x"]], densities[[i]][["y"]], xout = {{mean}})$y)*(densities[[i]][["n"]]/densities[[i]][["fragments"]]))
+        x = x + ifelse(is.na(b), 0, b)
+      }
+      return(as.numeric(x))
+    }
+  }
+  if (neither_assignment == "log_reg"){
+    
+  }
+  
+  if (neither_assignment == "none"){
+    assign_neither <- function(mean, r, cutoff_MAR, cutoff_MNAR){
+    return(0)
+    }  
+  }
+  #calculate cutoffs from percentage values
+  r = nrow(data%>%dplyr::distinct({{r_replicate}}))
+  cutoff_MNAR = (r * percent_cutoff_MNAR) %/% 100
+  cutoff_MAR = r - ((r*(100-percent_cutoff_MAR))%/%100)
+  
+  #fetch values you want not to be NA for imputed values - using pep_stripped_sequence and pg_protein_accessions as those may be interesing for graphing
+  peps <- get_keys(data, group = {{precursor}}, x = {{pep_sequences}})
+  prots <- get_keys(data, group = {{precursor}}, x = {{prot_acc}})
+  #complete dataframe with NA values to impute - fill in values for pep_stripped_sequence and pg_protein_accessions from "keys"
+  data_NA <- data %>%
+    dplyr::distinct( {{precursor}}, {{r_condition}}, {{r_replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    tidyr::complete( {{precursor}}, {{r_condition}}, {{r_replicate}}, fill = list(area = NA))%>%
+    dplyr::mutate(pep_stripped_sequence = ifelse(is.na({{pep_sequences}}), peps[{{precursor}},], {{pep_sequences}}))%>%
+    dplyr::mutate(pg_protein_accessions = ifelse(is.na({{prot_acc}}), prots[{{precursor}},], {{prot_acc}}))%>%
+    dplyr::mutate(condrep = ifelse(is.na(condrep), paste({{r_condition}}, {{r_replicate}}, sep = "_"), condrep))%>%
+    #count missing values
+    group_by({{precursor}}, {{r_condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    ungroup()
+  
+  
+  data_imputed <- data_NA %>%
+    #select columns condrep, condition, precursor, intensity
+    dplyr::select({{r_condrep}}, {{r_condition}}, {{precursor}}, {{intensity}}, missing, deleted, gen.missingness)%>%
+    #fill out missing combinations of precursor values
+    tidyr::complete({{precursor}}) %>%
+    #non NA values arranged in descending order groups by condrep
+    dplyr::arrange(!is.na({{intensity}}), {{r_condrep}}) %>% 
+    #calculate mean and standard deviation of intesity within each group (precursor and condition)
+    group_by({{precursor}}, {{r_condition}})%>%
+    dplyr::mutate(mean = mean({{intensity}}, na.rm = TRUE)) %>%
+    dplyr::mutate(sd = sd({{intensity}}, na.rm = TRUE))%>%
+    #count replicates
+    dplyr::mutate(repl = dplyr::n())%>%
+    #enumerator to select select value (ranks within each group)
+    dplyr::mutate(rnk = 1:dplyr::n())%>%
+    #assing missingness added by me
+    rowwise()%>%
+    dplyr::mutate(missingness = "neither")%>%
+    dplyr::mutate(missingness = ifelse(repl - missing <= cutoff_MNAR, "MNAR", 
+                                       ifelse(missing == 0, "complete", ifelse(repl - missing >= cutoff_MAR, "MAR", missingness))))%>%
+    #mark conditions shouldn't be imputed from (e.g.imputation reference not MAR or complete) - can be changed, only imputes from MAR and complete as default
+    dplyr::mutate(imputation_ref = ifelse(missingness %in% imputation_reference, TRUE, FALSE))%>%
+    #assign neither conditions
+    dplyr::mutate(neither_assigner = ifelse(missingness == "neither", assign_neither(mean, r, cutoff_MAR, cutoff_MNAR), 0))%>%
+    dplyr::mutate(missingness_new = ifelse(neither_assigner>0, "MNAR", ifelse(neither_assigner<0, "MAR", "neither")))%>%
+    dplyr::mutate(missingness = ifelse(missingness == "neither", missingness_new, missingness))%>%
+    #delete means that aren't in imputation_reference
+    #dplyr::mutate(mean = ifelse(imputation_ref, mean, NA))%>%
+    group_by({{precursor}})%>%
+    #mean across sd's of the conditions for new sd 
+    dplyr::mutate(sd = mean(sd, na.rm = TRUE))%>%
+    #add skip value (by me)  - if all mean values are NA in both conditions creates errors in min and rnorm functions
+    dplyr::mutate(skip = all(is.na(mean)))%>%
+    #minimum intensity per precursor, if all NA will return inf - ifelse statement as bugfix: to avoid imputation where "imputation reference" is "neither" or "MNAR" the skip boolean was added 
+    dplyr::mutate(min = ifelse(skip, NA, min(mean, na.rm = TRUE)))%>%
+    #iterate over rows if intensity is NA imputes - if "all" or one replicate is missing imputes as MNAR, else if one replicate is missing impute MAR, if       not NA takes intesity_log2 - changed by me to include MAR definition, changed cutoffs from numerical values to variable
+    rowwise() %>%
+    dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(is.na({{intensity}}),ifelse(skip, NA, 	
+                                                                                         ifelse(missingness == "MNAR", impute_MNAR(missing, min, sd, rnk), 
+                                                                                                ifelse(missingness == "MAR", impute_MAR(missing, mean, sd, rnk), {{intensity}}))), {{intensity}})) %>%
+    #mark imputed values as such
+    dplyr::mutate(imputed = is.na({{intensity}}))%>%
+    dplyr::select({{r_condrep}}, {{precursor}}, normalised_intensity_imputed_log2, imputed, missingness)%>%
+    ungroup()
+  #join with imputed data with data
+  data_NA %>%
+    left_join(data_imputed, by = c(as_label(enquo(r_condrep)), as_label(enquo(precursor))))%>%
+    #filter out nan values
+    dplyr:: filter(!(is.na(normalised_intensity_imputed_log2)))
+} 
+
+#function that outputs NA completed dataframe for imp4p imputation
+get_NA <- function(data = deleted_raw_norm, precursor = fg_id, r_condition = r_condition, r_replicate = r_replicate, intensity = normalised_intensity_log2, pep_sequences = pep_stripped_sequence, prot_acc = pg_protein_accessions){
+
+  #fetch values you want not to be NA for imputed values - using pep_stripped_sequence and pg_protein_accessions as those may be interesing for graphing
+  peps <- get_keys(data, group = {{precursor}}, x = {{pep_sequences}})
+  prots <- get_keys(data, group = {{precursor}}, x = {{prot_acc}})
+  
+  #Completes missing values with NAs, peptide sequences and protein accessions 
+  deleted_NA <- data %>%
+      dplyr::distinct( {{precursor}}, {{r_condition}}, {{r_replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+      tidyr::complete( {{precursor}}, {{r_condition}}, {{r_replicate}}, fill = list(area = NA))%>%
+      dplyr::mutate(pep_stripped_sequence = ifelse(is.na({{pep_sequences}}), peps[{{precursor}},], {{pep_sequences}}))%>%
+      dplyr::mutate(pg_protein_accessions = ifelse(is.na({{prot_acc}}), prots[{{precursor}},], {{prot_acc}}))%>%
+      dplyr::mutate(condrep = ifelse(is.na(condrep), paste({{r_condition}}, {{r_replicate}}, sep = "_"), condrep))%>%
+      #count missing values
+      group_by({{precursor}}, {{r_condition}})%>%
+      dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+      ungroup()
+  return(deleted_NA)
+}
+
+```
+
+```{r density calculation / missingness assignment, message=FALSE, warning=FALSE}
+#density distributions by missingness classificaiton
+densities <- calculate_densities()
+#add missingness classifications to clean and min filtered data 
+miss_keys <- get_miss_keys_clean()
+#add missingness and means to select precursors and conditions to delete
+DIA_raw_norm <- DIA_raw_norm%>%mutate(precond = paste(fg_id,r_condition, sep = "_"))%>%mutate(missingness = miss_keys[precond,])%>%group_by(fg_id, r_condition)%>%mutate(mean = mean(normalised_intensity_log2))
+#add missingness and means to select precursors and conditions to delete
+DIA_raw_Minimal_filtered <- DIA_raw_Minimal_filtered%>%mutate(precond = paste(fg_id,r_condition, sep = "_"))%>%mutate(missingness = miss_keys[precond,])%>%group_by(fg_id, r_condition)%>%mutate(mean = mean(normalised_intensity_log2))%>%mutate(precondrep = paste(precond, r_replicate, sep= "_"))
+
+```
+
+```{r kernel_density_estimation by number of missing samples functions, message=FALSE, warning=FALSE}
+#functions to add maxline in KDEs but buggy at the moment
+#finds maximum within density function
+#https://ianmadd.github.io/pages/PeakDensityDistribution.html
+densMode <- function(x){
+    td <- density(x, na.rm = TRUE)
+    maxDens <- which.max(td$y)
+    return(td$x[maxDens])
+}
+
+#get list of maxes per missingness classification
+MaxDensList <- function(y, is_imputed = FALSE){
+  missing_values <- y%>%distinct(missingness)%>%arrange(missingness)                   
+  missing_v <- missing_values$missingness
+  modes = c()
+  for (i in 1:length(missing_v)){
+    list <- as.vector(y%>%filter(missingness == missing_v[i])%>%ungroup()%>%select(normalised_intensity_log2))
+    modes[i] <- densMode(list[[1]])
+  }
+  return(modes)
+}
+#get list of maxes per missingness classification - density functions fitted to means
+MaxDensList_mean <- function(y, is_imputed = FALSE){
+  missing_values <- y%>%distinct(missingness)%>%arrange(missingness)                   
+  missing_v <- missing_values$missingness
+  modes = c()
+  for (i in 1:length(missing_v)){
+    list <- as.vector(y%>%filter(missingness == missing_v[i])%>%ungroup()%>%select(mean))
+    modes[i] <- densMode(list[[1]])
+  }
+  return(modes)
+}
+
+```
+
+```{r KDE according to missingness, message=FALSE, warning=FALSE}
+#KDEs of clean and unfiltered data
+plot <- ggplot(aes(x= normalised_intensity_log2, colour = missingness), data = DIA_raw_norm) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_clean")#+
+  #geom_vline(xintercept = MaxDensList(DIA_raw_norm, is_imputed = FALSE))
+
+plot
+ggsave("KDE_clean.pdf", plot = plot)
+
+plot <- ggplot(aes(x= mean, colour = missingness), data = DIA_raw_norm) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_clean_mean")#+
+  #geom_vline(xintercept = MaxDensList_mean(DIA_raw_norm, is_imputed = FALSE))
+
+plot
+ggsave("KDE_clean_mean.pdf", plot = plot)
+
+plot <- ggplot(aes(x= normalised_intensity_log2, colour = missingness), data = DIA_raw_Minimal_filtered) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_min_filtered")#+
+  #geom_vline(xintercept = MaxDensList(DIA_raw_Minimal_filtered, is_imputed = FALSE))
+
+plot
+ggsave("KDE_min_filtered.pdf", plot = plot)
+
+plot <- ggplot(aes(x= mean, colour = missingness), data = DIA_raw_Minimal_filtered) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_min_filtered_mean")#+
+  #geom_vline(xintercept = MaxDensList_mean(DIA_raw_Minimal_filtered, is_imputed = FALSE))
+
+plot
+ggsave("KDE_min_filtered_mean.pdf", plot = plot)
+
+
+# plot <- missingness(data = DIA_raw_Minimal_filtered, precursor = fg_id, condition = r_condition, intensity = normalised_intensity_log2, replicate = r_replicate, percent_cutoff_MNAR= 30, percent_cutoff_MAR=70)%>%ggplot(aes(x= normalised_intensity_log2, colour = missingness))+
+#   xlim(0,25)+
+#   geom_density()+
+#   ggtitle("KDE_min_filtered_miss_assignment")
+# 
+# plot
+# ggsave("KDE_min_filtered_miss_assignment.pdf", plot = plot)
+
+```
+
+
+
+```{r random draws from data, message=FALSE, warning=FALSE}
+
+#random draws from density distributions for MNAR and MAR to select conditions to delete
+#https://stackoverflow.com/questions/32871602/r-generate-data-from-a-probability-density-distribution
+MAR_draw <- function(densities. = densities, N = 300){
+  #N random draws from PDF of MAR
+  random.points <- approx(
+  cumsum(densities.[[1]][["y"]])/sum(densities.[[1]][["y"]]),
+ densities.[[1]][["x"]],
+  runif(N)
+)$y
+  print(densities.[[1]][["data.name"]])
+  return(random.points)
+}
+
+MNAR_draw <- function(densities. = densities, N = 300){
+  #N random draws from PDF of MNAR
+  random.points <- approx(
+  cumsum(densities.[[2]][["y"]])/sum(densities.[[2]][["y"]]),
+ densities.[[2]][["x"]],
+  runif(N)
+)$y
+  print(densities.[[2]][["data.name"]])
+  return(random.points)
+}
+#random draws filtered for only values where we have usable groundtruths - MNAR below filter cutoff, MAR above filter cutoff
+set.seed(123)
+MARs <- MAR_draw()
+MARs_filt <- MARs[MARs > 10]
+set.seed(123)
+MNARs <- MNAR_draw()
+MNARs_filt <- MNARs[MNARs < 10]
+MNARs_filt <- MNARs_filt[MNARs_filt> 6]
+hist(MARs_filt, 100)
+hist(MNARs_filt, 100)
+
+```
+
+```{r delete values, message=FALSE, warning=FALSE}
+
+#delete datapoints from random MAR and MNAR draws
+
+delete_data <- function(data = DIA_raw_Minimal_filtered, category= c("MNAR"), MNARdraws = MNARs_filt, MARdraws = MARs_filt){
+  
+  #add complete boolean to data - only delete from complete data
+  data <- mark_completes(data = data)
+  
+  #add replicate enumerator obs per precursor and condition, add boolean to keep track of whether precursor and condition has bee deleted from - prevents "double deletion"
+  data <- data%>%group_by(fg_id, r_condition)%>%
+    mutate(obs = row_number())%>%
+    mutate(deleted = FALSE)%>%
+    ungroup()
+  #generate subset of complete values to delete from
+  subset <- data%>%filter(is_complete == TRUE)%>%
+    ungroup()%>%
+    distinct(precond, mean, normalised_intensity_log2)
+  #fetch number of replicates
+  r = nrow(data%>%dplyr::distinct(r_replicate))
+  
+  #check category variable to see if MNARs should be deleted
+  if("MNAR" %in% category){
+    to_delete <- c()
+    #iterate thtrough list of MNAR draws
+    for (i in 1:length(MNARdraws)){
+      #find the closest precursor and condition to value on list of MNAR draws
+      closest_value <- subset[which.min(abs(MNARdraws[i] - subset$mean)),]
+      #fetch precursor and condition grouping variable - closest to value
+      closest_precond <- closest_value$precond
+      #adds precursor and condition to list of values to be deleted
+      to_delete[i] <- closest_precond
+      #mark to be deleted value as such in the subset of "deletable" complete conditions to prevent double deletion by setting mean and intensity to NA
+      subset <- subset%>%mutate(mean = ifelse(precond %in% to_delete, NA, mean))%>%mutate(normalised_intensity_log2 = ifelse(precond %in% to_delete, NA, normalised_intensity_log2))
+    }
+    #subset after MNAR "to be deleted" selections saved for checking
+    subset_post_MNAR <<- subset
+    #random draw of 3-4 replicates from precursors and condition on list of "to be deleted" to generate synthetic MNARs, mark as deleted, set intensities to NA, set gen.missingness to MNAR for later traceback
+    data <- data%>%group_by(precond)%>%mutate(draw = ifelse(precond %in% to_delete, sample(1:r, r - sample(0:1,1)), 0))%>%mutate(deleted = ifelse(obs %in% draw, TRUE, FALSE))%>%mutate(normalised_intensity_log2 = ifelse(deleted, NA, normalised_intensity_log2))%>%mutate(gen.missingness = ifelse(precond %in% to_delete, "MNAR", NA))%>%select(-draw)
+  }
+  #check category variable to see if MARs should be deleted
+  if ("MAR" %in% category){
+    to_delete <- c()
+    #iterate thtrough list of MNR draws
+    for (i in 1:length(MARdraws)){
+      #find the closest precursor and condition to value on list of MAR draws - from post MNAR subset 
+      closest_value <- subset_post_MNAR[which.min(abs(MARdraws[i] - subset$normalised_intensity_log2)),]
+      #fetch precursor and condition grouping variable - closest to value
+      closest_precond <- closest_value$precond
+      #adds precursor and condition to list of values to be deleted
+      to_delete[i] <- closest_precond
+      #mark to be deleted value as such in the subset of "deletable" complete conditions to prevent double deletion by setting mean and intensity to NA
+      subset_post_MNAR <- subset_post_MNAR%>%mutate(mean = ifelse(precond %in% to_delete, NA, mean))%>%mutate(normalised_intensity_log2 = ifelse(precond %in% to_delete, NA, normalised_intensity_log2))
+    }
+     #subset after MAR "to be deleted" selections saved for later checks
+    subset_post_MAR <<- subset_post_MNAR
+    #random draw of 1 replicate from precursors and condition on list of "to be deleted" to generate synthetic MARs, mark as deleted, set intensities to NA, set gen.missingness to MNAR for later traceback
+    data <- data%>%group_by(precond)%>%mutate(draw = ifelse(precond %in% to_delete, sample(1:r,1), 0))%>%mutate(deleted = ifelse(obs %in% draw, TRUE, deleted))%>%mutate(normalised_intensity_log2 = ifelse(deleted, NA, normalised_intensity_log2))%>%mutate(gen.missingness = ifelse(is.na(gen.missingness), ifelse(precond %in% to_delete, "MAR", NA), gen.missingness))%>%select(-draw)
+  }
+  #return data with syntheric missings
+  return(data)
+}
+
+# set.seed(123)
+# deleted_raw_MNAR <- delete_data()
+# 
+# set.seed(123)
+# deleted_raw_MAR <- delete_data(category= "MAR")
+
+#generate data with synthetic deletions
+set.seed(123)
+deleted_raw <- delete_data(category = c("MNAR", "MAR"))
+
+
+#plot histograms of means of the subsets post deletion - did we "over"-delete messing up our distributions?
+hist(subset_post_MNAR$mean, 100)
+hist(subset_post_MAR$mean, 100)
+```
+
+```{r deleted QC, message=FALSE, warning=FALSE}
+
+#perform data filtering on deleted raw data - lists of the deleted values made - to keep NA values in dataset log2 intensities changed to 1000 and changed back - that way sgen.missingness data retained through imputation
+#create deleted QC subdirectory
+subDir <- "deleted_QC"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+#generate list of MNARs and MARs that were generated 
+deleted_preconds_MNAR <- deleted_raw%>%filter(gen.missingness =="MNAR", deleted == TRUE)%>%select(precond, r_replicate, deleted, gen.missingness, normalised_intensity_log2)
+deleted_preconds_MAR <- deleted_raw%>%filter(gen.missingness =="MAR", deleted == TRUE)%>%select(precond, r_replicate, deleted, gen.missingness, normalised_intensity_log2)
+
+#perform data filtering on the deleted data - sets intensity to 1000 temporarily to prevent them being filtered out - would caus gen.missingness and deleted boolean to be lost
+deleted_raw_norm<- deleted_raw %>%ungroup()%>%
+  filter(eg_is_decoy == FALSE) %>%
+  filter(pep_is_proteotypic == "TRUE")%>%
+  mutate(normalised_intensity_log2 = ifelse(is.na(normalised_intensity_log2), 1000, normalised_intensity_log2))%>%
+  filter(normalised_intensity_log2 > 10)%>%
+  select(-obs,  -missingness, -precond)%>%
+  mutate(normalised_intensity_log2 = ifelse(normalised_intensity_log2 == 1000, NA, normalised_intensity_log2))
+
+#post filtering intensity distribution
+plot <- qc_intensity_distribution(
+  data = deleted_raw_norm,
+  grouping = fg_id,
+  intensity = normalised_intensity_log2,
+  plot_style = "histogram"
+)
+plot
+ggsave("Intensity_distribution_raw.pdf", plot = plot)
+
+
+
+```
+
+```{r imp4p, message=FALSE, warning=FALSE}
+
+#generate matrix with fg_id as rows, condrep as columns, intensities as values
+matrix_deleted <- acast(deleted_raw_norm, fg_id~condrep, value.var = "normalised_intensity_log2")
+
+#conditions of the columns for the imp4p function
+conditions <- factor(c("DMSO_H2O","DMSO_H2O","DMSO_H2O","DMSO_H2O","Rapa_H2O","Rapa_H2O","Rapa_H2O","Rapa_H2O"))
+
+#imp4p imputation on synthetic deletetion dataset
+imp4p_imputed_matrix<- impute.mi(tab = matrix_deleted, conditions = conditions)
+
+#rownames and colnames transfered to imputed data
+row.names(imp4p_imputed_matrix) <- row.names(matrix_deleted)
+colnames(imp4p_imputed_matrix) <- colnames(matrix_deleted)
+
+#imputed dataframe generated from imputed matrix
+df_imp4p_imputed <- melt(imp4p_imputed_matrix)
+
+#columns of new dataframe labeled
+colnames(df_imp4p_imputed) <- c("fg_id", "condrep", "normalised_intensity_imputed_log2")
+
+#get complete dataset with NA values to fill in with imputed values
+deleted_NA <- get_NA()
+
+#fill out dataset completed with NA with imputed values
+imp4p_imputed <- df_imp4p_imputed%>%left_join(deleted_NA, by = c("fg_id", "condrep"))%>%mutate(imputed = is.na(normalised_intensity_log2))%>%relocate(normalised_intensity_imputed_log2, .after = last_col())
+
+
+```
+
+```{r evaluate MNARs, message=FALSE, warning=FALSE}
+
+#MNAR imputation methods to iterate over
+MNAR_methods = c("imp4p","TS", "VR", "LG")
+#MAR methods to iterate over 
+MAR_methods = c("imp4p", "LG")
+#fetch keys for all groundtruth intensities
+intensity_groundtruths <- get_keys(DIA_raw_Minimal_filtered, precondrep, mean)
+
+
+#function compares groundtruth intensities to imputed values of each imputation method by correlation and MSD - saves values and plots corplot and KDE of imputed and groundtruth intensities
+evaluate_imputation <- function(data. = deleted_raw_norm){
+  #generate subdirectory for MNAR imputation evaluation
+  subDir <- "deleted_MNAR_eval"
+
+  if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+  } else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+  }
+  #generate dataframe to save MNAR imputation eval 
+  MNAR_eval = data.frame(colnames(c("cor", "MSD", "method")))
+  #generate list of synthetic missing MNAR values
+  deleted_MNARs <<- deleted_preconds_MNAR%>%filter(gen.missingness == "MNAR", deleted == TRUE)%>%mutate(precondrep = paste(precond, r_replicate, sep = "_"))%>%ungroup()
+  #iterate over MNAR imputaiton methods
+  for (i in 1:length(MNAR_methods)){
+    #imp4p imputation already done - evalutation done seperately with if statement
+    if (MNAR_methods[i] == "imp4p"){
+      #select synthetic missings, fetch groundtruth intensities from groundtruth intensity keys, calculate square differences 
+      evaluate_MNARs <- imp4p_imputed%>%filter(precondrep %in% deleted_MNARs$precondrep)%>%select(precondrep,imputed, gen.missingness, normalised_intensity_imputed_log2)%>%mutate(groundtruth_intensity = intensity_groundtruths[precondrep,])%>%filter(groundtruth_intensity <10)%>%mutate(sqdiff = (groundtruth_intensity - normalised_intensity_imputed_log2)^2)
+      #calculate correlation between groundtruths and normalised intensities
+      cor_MNAR <- cor(evaluate_MNARs$groundtruth_intensity, evaluate_MNARs$normalised_intensity_imputed_log2)
+      
+      #calculate mean sq difference
+      mean_sqdiff_MNAR <- (mean(evaluate_MNARs$sqdiff))
+      #add correlation MSD and method to the MNAR eval dataframe
+      MNAR_eval <- rbind(MNAR_eval, c(cor_MNAR,mean_sqdiff_MNAR,MNAR_methods[i]))
+      #save name for KDE plot
+      plotname = paste("KDE_deleted_imputed_MNAR", MNAR_methods[i], sep = "_")
+      #plot KDE of imputed vs groundtruth intensities
+      plot <- evaluate_MNARs%>%ggplot() +
+        xlim(5,20)+
+        geom_density(aes(x= normalised_intensity_imputed_log2, colour = "imputed_intensity"))+
+        geom_density(aes(x= groundtruth_intensity, colour = "groundtruth_intensity"))+
+        ggtitle(plotname)#+
+        #geom_vline(xintercept = MaxDensList(DIA_raw_norm, is_imputed = FALSE))
+      plot
+      #set wd and save plot
+      setwd(file.path(mainDir, subDir))
+      ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+      #plotname for corplot
+      plotname = paste("Corplot_deleted_imputed_MNAR", MNAR_methods[i], sep = "_")
+      #plot corplot of imputed vs groudntruth intensities
+      plot <- ggplot(evaluate_MNARs, aes(x = normalised_intensity_imputed_log2, y=groundtruth_intensity))+
+        geom_point()+
+        geom_smooth(method = lm)+
+        xlim(8,12)+ylim(8,12)+
+        ggtitle(plotname)
+      plot
+      #set wd and save plot
+      setwd(file.path(mainDir, subDir))
+      ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+      #skip to next itreation of non imp4p imputaiton methods
+      next()
+    }
+    #impute deleted data with each MNAR nethod iteratively (MNAR method i )
+    set.seed(123)
+    deleted_imputed <- DIA_imputation(data., imputation_MNAR= MNAR_methods[i])%>%mutate(precondrep = paste(paste(fg_id, r_condition, sep = "_"), r_replicate, sep = "_"))
+    #select synthetic missings, fetch groundtruth intensities from groundtruth intensity keys, calculate square differences 
+    evaluate_MNARs <- deleted_imputed%>%filter(precondrep %in% deleted_MNARs$precondrep)%>%select(precondrep,imputed, missingness, gen.missingness, normalised_intensity_imputed_log2)%>%mutate(groundtruth_intensity = intensity_groundtruths[precondrep,])%>%filter(groundtruth_intensity <10)%>%mutate(sqdiff = (groundtruth_intensity - normalised_intensity_imputed_log2)^2)
+    #calculate correlation between groundtruths and normalised intensities
+    cor_MNAR <- cor(evaluate_MNARs$groundtruth_intensity, evaluate_MNARs$normalised_intensity_imputed_log2)
+    #calculate mean sq difference
+    mean_sqdiff_MNAR <- (mean(evaluate_MNARs$sqdiff))
+    #add correlation MSD and method to the MNAR eval dataframe
+    MNAR_eval <- rbind(MNAR_eval, c(cor_MNAR,mean_sqdiff_MNAR,MNAR_methods[i]))
+    #save name for KDE plot
+    plotname = paste("KDE_deleted_imputed_MNAR", MNAR_methods[i], sep = "_")
+    #plot KDE of imputed vs groundtruth intensities
+    plot <- evaluate_MNARs%>%filter(missingness == "MNAR")%>%ggplot() +
+      xlim(5,20)+
+      geom_density(aes(x= normalised_intensity_imputed_log2, colour = "imputed_intensity"))+
+      geom_density(aes(x= groundtruth_intensity, colour = "groundtruth_intensity"))+
+      ggtitle(plotname)#+
+      #geom_vline(xintercept = MaxDensList(DIA_raw_norm, is_imputed = FALSE))
+
+    plot
+    #set wd and save plot
+    setwd(file.path(mainDir, subDir))
+    ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+    #plotname for corplot
+    plotname = paste("Corplot_deleted_imputed_MNAR", MNAR_methods[i], sep = "_")
+    #plot corplot of imputed vs groudntruth intensities
+    plot <- ggplot(evaluate_MNARs, aes(x = normalised_intensity_imputed_log2, y=groundtruth_intensity))+
+      geom_point()+
+      geom_smooth(method = lm)+
+      xlim(8,12)+ylim(8,12)+
+      ggtitle(plotname)
+    plot
+    #set wd and save plot
+    setwd(file.path(mainDir, subDir))
+    ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+  }
+  #update colnames of MNAR eval dataframe
+  colnames(MNAR_eval) <-c("cor", "MSD", "method")
+  #set wd and save MNAR eval dataframe as csv
+  setwd(file.path(mainDir, subDir))
+  write.csv(MNAR_eval, file = "MNAR_eval.csv")
+  
+  
+  #creat subdirectory for MAR eval
+  subDir <- "deleted_MAR_eval"
+
+  if (file.exists(subDir)){
+      setwd(file.path(mainDir, subDir))
+  } else {
+      dir.create(file.path(mainDir, subDir))
+      setwd(file.path(mainDir, subDir))
+      
+  }
+  #generate dataframe to save MAR imputation eval 
+  MAR_eval = data.frame(colnames(c("cor", "MSD", "method")))
+  #generate list of synthetic missing MAR values
+  deleted_MARs <- deleted_preconds_MAR%>%filter(gen.missingness == "MAR", deleted == TRUE)%>%mutate(precondrep = paste(precond, r_replicate, sep = "_"))%>%ungroup()
+  #iterate over MNAR imputaiton methods
+  for (i in 1:length(MAR_methods)){
+    #imp4p imputation already done - evalutation done seperately with if statement
+    if (MAR_methods[i] == "imp4p"){
+      #select synthetic missings, fetch groundtruth intensities from groundtruth intensity keys, calculate square differences 
+      evaluate_MARs <- imp4p_imputed%>%filter(precondrep %in% deleted_MARs$precondrep)%>%select(precondrep,imputed, gen.missingness, normalised_intensity_imputed_log2)%>%mutate(groundtruth_intensity = intensity_groundtruths[precondrep,])%>%filter(normalised_intensity_imputed_log2>10)%>%mutate(sqdiff = (groundtruth_intensity - normalised_intensity_imputed_log2)^2)
+      #calculate correlation between groundtruths and normalised intensities
+      cor_MAR <- cor(evaluate_MARs$normalised_intensity_imputed_log2, evaluate_MARs$groundtruth_intensity)
+      #calculate mean sq difference
+      mean_sqdiff_MAR <- (mean(evaluate_MARs$sqdiff))
+      #add correlation MSD and method to the MAR eval dataframe
+      MAR_eval <- rbind(MAR_eval, c(cor_MAR,mean_sqdiff_MAR,MAR_methods[i]))
+      #save plotname for KDE
+      plotname = paste("KDE_deleted_imputed_MAR", MAR_methods[i], sep = "_")
+      #plot KDE of imputed vs groundtruth intensities
+      plot <- evaluate_MARs%>%ggplot() +
+        xlim(5,20)+
+        geom_density(aes(x= normalised_intensity_imputed_log2, colour = "imputed_intensity"))+
+        geom_density(aes(x= groundtruth_intensity, colour = "groundtruth_intensity"))+
+        ggtitle(plotname)#+
+        #geom_vline(xintercept = MaxDensList(DIA_raw_norm, is_imputed = FALSE))
+      
+      plot
+      #set wd and save plot
+      setwd(file.path(mainDir, subDir))
+      ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+      #save plotname for corplot
+      plotname = paste("Corplot_deleted_imputed_MAR", MAR_methods[i], sep = "_")
+      #plot corplot of imputed vs groundtruth intensities
+      plot <- ggplot(evaluate_MARs, aes(x = normalised_intensity_imputed_log2, y=groundtruth_intensity))+
+        geom_point()+
+        geom_smooth(method = lm)+
+        xlim(5,16)+ylim(5,16)+
+        ggtitle(plotname)
+      plot
+      #set wd and save plot
+      setwd(file.path(mainDir, subDir))
+      ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+      #skip to next iteration 
+      next()
+    }
+    #only one method of MAR imputation aside from imp4p - no reimputation needed
+    #select synthetic missings, fetch groundtruth intensities from groundtruth intensity keys, calculate square differences
+    evaluate_MARs <- deleted_imputed%>%filter(precondrep %in% deleted_MARs$precondrep)%>%select(precondrep,imputed, missingness, gen.missingness, normalised_intensity_imputed_log2)%>%mutate(groundtruth_intensity = intensity_groundtruths[precondrep,])%>%filter(missingness == "MAR")%>%mutate(sqdiff = (groundtruth_intensity - normalised_intensity_imputed_log2)^2)
+    #calculate correlation between groundtruths and normalised intensities
+    cor_MAR <- cor(evaluate_MARs$normalised_intensity_imputed_log2, evaluate_MARs$groundtruth_intensity)
+    #calculate mean sq difference
+    mean_sqdiff_MAR <- (mean(evaluate_MARs$sqdiff))
+    #add correlation MSD and method to the MAR eval dataframe
+    MAR_eval <- rbind(MAR_eval, c(cor_MAR,mean_sqdiff_MAR,MAR_methods[i]))
+    #save plotname for KDE
+    plotname = paste("KDE_deleted_imputed_MAR", MAR_methods[i], sep = "_")
+    #plot KDE of imputed vs groundtruth intensities
+    plot <- evaluate_MARs%>%filter(missingness == "MAR")%>%ggplot() +
+      xlim(5,20)+
+      geom_density(aes(x= normalised_intensity_imputed_log2, colour = "imputed_intensity"))+
+      geom_density(aes(x= groundtruth_intensity, colour = "groundtruth_intensity"))+
+      ggtitle(plotname)#+
+      #geom_vline(xintercept = MaxDensList(DIA_raw_norm, is_imputed = FALSE))
+      
+    plot
+    #set wd and save plot
+    setwd(file.path(mainDir, subDir))
+    ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+    #save plotname for corplot
+    plotname = paste("Corplot_deleted_imputed_MAR", MAR_methods[i], sep = "_")
+    #plot corplot of imputed vs groundtruth intensities
+    plot <- ggplot(evaluate_MARs, aes(x = normalised_intensity_imputed_log2, y=groundtruth_intensity))+
+      geom_point()+
+      geom_smooth(method = lm)+
+      xlim(5,16)+ylim(5,16)+
+      ggtitle(plotname)
+    plot
+    #set wd and save plot
+    setwd(file.path(mainDir, subDir))
+    ggsave(paste(plotname, ".pdf", sep =""), plot = plot)
+  }
+  #update colnames for MAR wval dataframe
+  colnames(MAR_eval) <-c("cor", "MSD", "method")
+  #set wd and save MAR eval dataframe as csv
+  setwd(file.path(mainDir, subDir))
+  write.csv(MAR_eval, file = "MAR_eval.csv")
+}
+
+evaluate_imputation()
+
+
+
+```
+
