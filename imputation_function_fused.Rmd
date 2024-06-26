@@ -21,16 +21,16 @@ library(heatmaply)
 
 ```{r loading_data, message=FALSE, warning=FALSE}
 
-working_directory = "Z:/jumogl/JM003_AT222/Spectronaut output"
-file_name = "20240411_162202_20240407072240_Report_Eclipse_MD.csv"
+working_directory = "Z:/jumogl/JM002_LiPSchool/Spectronaut output"
+file_name = "20240321_153536_20240320093116_Report.csv"
 
 setwd(working_directory)
-
+#load data
 DIA_raw <- read_protti(file_name)
-
+#set a main and sub directory
 mainDir <- working_directory
 subDir <- "Plots_Imputation"
-
+#check if subdirectory already exists - if not created - set as working directory
 if (file.exists(subDir)){
   setwd(file.path(mainDir, subDir))
 } else {
@@ -38,9 +38,9 @@ if (file.exists(subDir)){
   setwd(file.path(mainDir, subDir))
   
 }
-
+#change main directory to subdirectory created
 mainDir <- file.path(mainDir, subDir)
-
+#add grouping variable of condition and replicate to data
 DIA_raw$condrep <- paste(DIA_raw$r_condition,DIA_raw$r_replicate, sep = "_")
 
 
@@ -49,7 +49,7 @@ DIA_raw$condrep <- paste(DIA_raw$r_condition,DIA_raw$r_replicate, sep = "_")
 
 
 ```{r cleaning_data, message=FALSE, warning=FALSE}
-
+#create QC subdirectory - set as subdirectory
 subDir <- "QC"
 
 if (file.exists(subDir)){
@@ -59,7 +59,18 @@ if (file.exists(subDir)){
     setwd(file.path(mainDir, subDir))
     
 }
-
+#generate minimal filtered dataset to later fit density functions for MNAR and MAR - later used to classify "neither" conditions by logistic regression
+DIA_raw_Minimal_filtered <- DIA_raw%>%
+  filter(eg_is_decoy == FALSE) %>%
+  mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
+  normalise(
+    sample = r_file_name,
+    intensity_log2 = intensity_log2,
+    method = "median"
+  ) %>%
+  filter(pep_is_proteotypic == TRUE)%>%
+  filter(normalised_intensity_log2 > 4)
+#filter and normalise data
 DIA_raw_norm<- DIA_raw %>%
   filter(eg_is_decoy == FALSE) %>%
   mutate(intensity_log2 = log2(fg_ms2raw_quantity))%>%
@@ -69,9 +80,9 @@ DIA_raw_norm<- DIA_raw %>%
     method = "median"
   ) %>%
   filter(pep_is_proteotypic == TRUE)%>%
-  filter(fg_ms2raw_quantity > 32)
+  filter(normalised_intensity_log2 > 10)
 
-
+#plot intensity distribution
 plot <- qc_intensity_distribution(
   data = DIA_raw_norm,
   grouping = fg_id,
@@ -88,6 +99,7 @@ ggsave("Intensity_distribution_raw.pdf", plot = plot)
 
 #define functions
 ```{r imputation_function_fused, message=FALSE, warning=FALSE}
+#function that fetches a value tied to a give grouping variable to be applied to another dataset - eg get pepstripped sequence of a given fragment to apply to imputed value
  get_keys <- function(data, group, x){
     df <- data %>% distinct({{group}}, .keep_all = TRUE)
     group <- df%>%pull({{group}})
@@ -95,28 +107,105 @@ ggsave("Intensity_distribution_raw.pdf", plot = plot)
     keys <- data.frame(row.names= group, val=x)
     return (keys)
   }
+#plot density functions by level of missingness - missingness classification taken from filtered data, applied to unfiltered data for more complete distribution
+calculate_densities <- function(data_clean = DIA_raw_norm, data_raw = DIA_raw_Minimal_filtered, precursor = fg_id, condition = r_condition, intensity = normalised_intensity_log2, r_replicate = r_replicate){
+  #generate complete dataset filling missings wiht NA values, count number of missinf values per precursor and condiiton, add grouping variable per precursor and condition
+  data_NA <- data_clean %>%
+    dplyr::distinct( {{precursor}}, {{condition}}, {{r_replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    tidyr::complete( {{precursor}}, {{condition}}, {{r_replicate}}, fill = list(area = NA))%>%
+    #count missing values
+    group_by({{precursor}}, {{condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    #add grouping variable per precursor and condition
+    ungroup()%>%
+    dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))
+  #fetch number of missings by grouping variable for precursor and condition
+  miss_keys <- get_keys(data_NA, group = precond, x = missing)
+  #apply missing values to filtered data
+  data <- data_raw%>%dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))%>%dplyr::mutate(missing =  miss_keys[precond,])
+  #get distinct list of missings to iterate over
+  missings <- data%>%distinct(missing)%>%arrange(missing)
+  #omit misisng NA - comes from precursors only present in unfiltered data - discarded
+  missing_v <- na.omit(missings[[1]])
+  #list to save the density distributions for the levels of missingness
+  densities <- list()
+  #iterate over levels of missingness
+  for (i in 1:length(missing_v)){
+    #fetch log2 intensities of level of missingness
+    values <- data%>%filter(missing == missing_v[i])%>%select({{intensity}})
+    #fit density distribution to intensities and save on list of density distributions
+    densities <- append(densities,list(density(values[[1]])))
+    #label level of missingness
+    densities[[i]][["data.name"]] <- paste(missing_v[i], "missing", sep = " ")
+    #count number of fragments generating density distribution - later used for normalization
+    densities[[i]][["fragments"]] <- data%>%filter(missing == missing_v[i])%>%distinct(fg_id)%>%nrow()
+  }
+  #return list of densities
+  return(densities)
+}
 
-
-
-DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imputation_MNAR = "LG", imputation_MAR = "LG", r_condition = r_condition, r_condrep = condrep, precursor = fg_id, intensity = normalised_intensity_log2, prot_acc = pg_protein_accessions, pep_sequences = pep_stripped_sequence, r_replicate = r_replicate, percent_cutoff_MNAR = 30, percent_cutoff_MAR = 70){
+#Full function to take logistic regression fitted to uncleaned data using missingness assignment from cleaned data - in uncleaned data intensity distributions for MNAR and MAR more normally distributed and sd can be calculated for MNAR conditions (which have max one datapoint in cleaned data) - fitted on "known" MAR MNAR values to help in assigning "neither" values which fall in between the MAR and MNAR cutoffs
+calculate_log_reg <- function(data_clean = DIA_raw_norm, data_raw = DIA_raw_Minimal_filtered, precursor = fg_id, condition = r_condition, intensity = normalised_intensity_log2, r_replicate = r_replicate, percent_cutoff_MNAR = 30, percent_cutoff_MAR = 70){
+  
+  #calculate replicated numbers and MNAR / MAR cutoffs
+  r = nrow(data_clean%>%dplyr::distinct({{r_replicate}}))
+  cutoff_MNAR = (r * percent_cutoff_MNAR) %/% 100
+  cutoff_MAR = r - ((r*(100-percent_cutoff_MAR))%/%100)
+  
+  #assign missingness on cleaned data, add grouping variable precond
+  data_NA <- data_clean %>%
+    dplyr::distinct( {{precursor}}, {{condition}}, {{r_replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    tidyr::complete( {{precursor}}, {{condition}}, {{r_replicate}}, fill = list(area = NA))%>%
+    #count missing values
+    group_by({{precursor}}, {{condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    #assign missingness classification
+    rowwise()%>%
+    dplyr::mutate(missingness = "neither")%>%
+    dplyr::mutate(missingness = ifelse(r - missing <= cutoff_MNAR, "MNAR", 
+                                       ifelse(missing == 0, "complete", ifelse(r - missing >= cutoff_MAR, "MAR", missingness))))%>%
+    #add grouping variable per precursor and condition
+    ungroup()%>%
+    dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))
+  #get missingness key dataframe to assign to uncleaned data by grouping variable precond
+  miss_keys <- get_keys(data_NA, group = precond, x = missingness)
+  #assign missingness to uncleaned data by precond variable - filter out all but MAR and MNAR values - add binary classifier for MR and MNAR - calculate sd's of normalised log2 intensity per precursor and condition
+  data <- data_raw%>%dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))%>%dplyr::mutate(missingness =  miss_keys[precond,])%>%filter(missingness %in% c("MAR", "MNAR"))%>%mutate(bin = ifelse(missingness == "MNAR", 0, ifelse(missingness == "MAR", 1, NA)))%>%group_by(fg_id, r_condition)%>%mutate(sd = sd(normalised_intensity_log2))%>%group_by(missingness)%>%add_count(missingness)%>%ungroup()%>%mutate(weights = max(n)/n)
+  #fit model with dependent variables normalised log2 intensity and sd
+  log_reg <- glm(bin~normalised_intensity_log2+sd, data = data, family = binomial(link = 'logit'), weights = weights)
+  
+  #return logistic regression model
+  return(log_reg)
+}
+#imputation function: imputation reference: select which missingness classifications to use as imputation references for MNAR impuation
+#neither assignment: choose method to assign missingness to conditions that fall between percentage cutoffs for MNAR and MAR classification - logreg best - otherwise none to not impute these conditions. MLE equivalent to logreg, just more computationally heavy
+#imputation MNAR: select imputaiton method to use for MNAR impuation
+#imputation MAR: selct method to use for MAR imputation - either LG or none
+#r_condition, r_condrep, precursor, intensity, prot_acc, pep_sequences, r_replicate: how these variable are called in the dataframe being imputed on
+#percent_cutoff_MNAR, percent_cutoff_MAR: cutoffs for missingness classification - if changed from default also schould be changed in logreg function, less than 30 replicates present - MNAR, more than 70 present MAR
+DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), neither_assignment = "log_reg", imputation_MNAR = "LG", imputation_MAR = "LG", r_condition = r_condition, r_condrep = condrep, precursor = fg_id, intensity = normalised_intensity_log2, prot_acc = pg_protein_accessions, pep_sequences = pep_stripped_sequence, r_replicate = r_replicate, percent_cutoff_MNAR = 30, percent_cutoff_MAR = 70){
   #define imputation methods - set to LG as default
   if ({{imputation_MNAR}} == "LG"){
+    #rnorm imputation with imputation fold-change of log2(3)
     impute_MNAR <- function(n_missing, min, sd, rnk){
       rnorm(n_missing, mean = min - log2(3), sd = sd)[rnk] }
   }
   if ({{imputation_MNAR}} == "VR"){
+    #rnorm imputation with imputation fold-change of 3
     impute_MNAR <- function(n_missing, min, sd, rnk){
       rnorm(n_missing, mean = min - 3, sd = sd)[rnk] }
   }
-   if ({{imputation_MNAR}} == "TS"){
+  if ({{imputation_MNAR}} == "TS"){
+    #rnorm imputation with imputation fold-change of log2(5)
     impute_MNAR <- function(n_missing, min, sd, rnk){
       rnorm(n_missing, mean = min - log2(5), sd = sd)[rnk] }
-   }
+  }
   if ({{imputation_MNAR}} == "none"){
     impute_MNAR <- function(n_missing, min, sd, rnk){
       return(NA)}
   }
-  if ({{imputation_MAR}} == "LG"){  
+  if ({{imputation_MAR}} == "LG"){
+    #rnorm imputation
     impute_MAR <- function(n_missing, mean, sd, rnk){
       rnorm(n_missing, mean = mean, sd = sd)[rnk] }
   }
@@ -124,7 +213,41 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
     impute_MAR <- function(n_missing, mean, sd, rnk){
       return(NA)}
   }
+  #define methods of classifying missinf values with missingness between cutoffs
+  if (neither_assignment == "MLE"){
+    assign_neither <- function(mean, r, cutoff_MAR, cutoff_MNAR, sd){
+      x = 0
+      #iterate over levels of missingness classified as MNAR
+      for(i in 1:(cutoff_MNAR+1)){
+        #add up likelihoods datapoint is part of one of distribution classified as MNAR
+        #print(densities[[i]][["data.name"]])
+        b = ((approx(densities[[i]][["x"]], densities[[i]][["y"]], xout = {{mean}})$y)*(densities[[i]][["n"]]/densities[[i]][["fragments"]]))
+        x = x - ifelse(is.na(b), 0, b)
+      }
+      #iterate over levels of missingness classified as MAR
+      for (i in (cutoff_MAR+1):(r+1)){
+        #add up likelihoods datapoint is part of one of distribution classified as MAR
+        #print(densities[[i]][["data.name"]])
+        b = ((approx(densities[[i]][["x"]], densities[[i]][["y"]], xout = {{mean}})$y)*(densities[[i]][["n"]]/densities[[i]][["fragments"]]))
+        x = x + ifelse(is.na(b), 0, b)
+      }
+      #return likelihood parameter for classification as either MAR or MNAR
+      return(as.numeric(x))
+    }
+  }
+  #neither assigning by logistic regression
+  if (neither_assignment == "log_reg"){
+     assign_neither <- function(mean, r, cutoff_MAR, cutoff_MNAR, sd){
+      x = predict(log_reg, newdata = data.frame(normalised_intensity_log2 = c(mean),sd = c(sd)), type = "response")
+      return(x + 0.5)
+    }
+  }
   
+  if (neither_assignment == "none"){
+    assign_neither <- function(mean, r, cutoff_MAR, cutoff_MNAR, sd){
+    return(NA)
+    }  
+  }
   #calculate cutoffs from percentage values
   r = nrow(data%>%dplyr::distinct({{r_replicate}}))
   cutoff_MNAR = (r * percent_cutoff_MNAR) %/% 100
@@ -139,11 +262,16 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
     tidyr::complete( {{precursor}}, {{r_condition}}, {{r_replicate}}, fill = list(area = NA))%>%
     dplyr::mutate(pep_stripped_sequence = ifelse(is.na({{pep_sequences}}), peps[{{precursor}},], {{pep_sequences}}))%>%
     dplyr::mutate(pg_protein_accessions = ifelse(is.na({{prot_acc}}), prots[{{precursor}},], {{prot_acc}}))%>%
-    dplyr::mutate(condrep = ifelse(is.na(condrep), paste({{r_condition}}, {{r_replicate}}, sep = "_"), condrep))
+    dplyr::mutate(condrep = ifelse(is.na(condrep), paste({{r_condition}}, {{r_replicate}}, sep = "_"), condrep))%>%
+    #count missing values
+    group_by({{precursor}}, {{r_condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    ungroup()
+  
   
   data_imputed <- data_NA %>%
     #select columns condrep, condition, precursor, intensity
-    dplyr::select({{r_condrep}}, {{r_condition}}, {{precursor}}, {{intensity}})%>%
+    dplyr::select({{r_condrep}}, {{r_condition}}, {{precursor}}, {{intensity}}, missing)%>%
     #fill out missing combinations of precursor values
     tidyr::complete({{precursor}}) %>%
     #non NA values arranged in descending order groups by condrep
@@ -152,8 +280,6 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
     group_by({{precursor}}, {{r_condition}})%>%
     dplyr::mutate(mean = mean({{intensity}}, na.rm = TRUE)) %>%
     dplyr::mutate(sd = sd({{intensity}}, na.rm = TRUE))%>%
-    #count missing values
-    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
     #count replicates
     dplyr::mutate(repl = dplyr::n())%>%
     #enumerator to select select value (ranks within each group)
@@ -163,8 +289,14 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
     dplyr::mutate(missingness = "neither")%>%
     dplyr::mutate(missingness = ifelse(repl - missing <= cutoff_MNAR, "MNAR", 
                                        ifelse(missing == 0, "complete", ifelse(repl - missing >= cutoff_MAR, "MAR", missingness))))%>%
-    #remove mean values that shouldn't be imputed on (e.g.imputation reference not MAR or complete) - can be changed, only imputes from MAR and complete as default
-    dplyr::mutate(mean = ifelse(missingness %in% imputation_reference, mean, NA))%>%
+    #mark conditions shouldn't be imputed from (e.g.imputation reference not MAR or complete) - can be changed, only imputes from MAR and complete as default
+    dplyr::mutate(imputation_ref = ifelse(missingness %in% imputation_reference, TRUE, FALSE))%>%
+    #assign neither conditions
+    dplyr::mutate(neither_assigner = ifelse(missingness == "neither", assign_neither(mean, r, cutoff_MAR, cutoff_MNAR, sd), 0))%>%
+    dplyr::mutate(missingness_new = ifelse(is.na(neither_assigner), "neither", ifelse(neither_assigner>0, "MNAR", ifelse(neither_assigner<=0, "MAR", "neither"))))%>%
+    dplyr::mutate(missingness = ifelse(missingness == "neither", missingness_new, missingness))%>%
+    #delete means that aren't in imputation_reference
+    #dplyr::mutate(mean = ifelse(imputation_ref, mean, NA))%>%
     group_by({{precursor}})%>%
     #mean across sd's of the conditions for new sd 
     dplyr::mutate(sd = mean(sd, na.rm = TRUE))%>%
@@ -174,9 +306,9 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
     dplyr::mutate(min = ifelse(skip, NA, min(mean, na.rm = TRUE)))%>%
     #iterate over rows if intensity is NA imputes - if "all" or one replicate is missing imputes as MNAR, else if one replicate is missing impute MAR, if       not NA takes intesity_log2 - changed by me to include MAR definition, changed cutoffs from numerical values to variable
     rowwise() %>%
-   dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(is.na({{intensity}}),ifelse(skip, NA, 	
-                                                             ifelse(missingness == "MNAR", impute_MNAR(missing, min, sd, rnk), 
-                                                                    ifelse(missingness == "MAR", impute_MAR(missing, mean, sd, rnk), {{intensity}}))), {{intensity}})) %>%
+    dplyr::mutate(normalised_intensity_imputed_log2 = ifelse(is.na({{intensity}}),ifelse(skip, NA, 	
+                                                                                         ifelse(missingness == "MNAR", impute_MNAR(missing, min, sd, rnk), 
+                                                                                                ifelse(missingness == "MAR", impute_MAR(missing, mean, sd, rnk), {{intensity}}))), {{intensity}})) %>%
     #mark imputed values as such
     dplyr::mutate(imputed = is.na({{intensity}}))%>%
     dplyr::select({{r_condrep}}, {{precursor}}, normalised_intensity_imputed_log2, imputed, missingness)%>%
@@ -192,7 +324,7 @@ DIA_imputation <- function(data,imputation_reference = c("complete", "MAR"), imp
 ```
 
 ```{r intensity_plotting_imputed, message=FALSE, warning=FALSE}
-
+#plot intensity distibution color coded for imputed vs nonimputed values 
 intensity_distribution_imputed <- function(data,grouping, intensity_log2, imputed) {
   
   plot <- data %>% ggplot2::ggplot(ggplot2::aes(x = {
@@ -215,7 +347,7 @@ intensity_distribution_imputed <- function(data,grouping, intensity_log2, impute
     return(plot)
   }
 
-
+#plot intensity distribution color coded for missingness classification
 intensity_distribution_missingness <- function(data,grouping, intensity_log2, missingness) {
   
   plot <- data %>% ggplot2::ggplot(ggplot2::aes(x = {
@@ -237,7 +369,21 @@ intensity_distribution_missingness <- function(data,grouping, intensity_log2, mi
       strip.text = ggplot2::element_text(size = 15), strip.background = element_blank())
     return(plot)
   }
-
+#function generate complete dataset with NAs - applies missingness classification and fetches missingness keys by percursor and condition 
+get_miss_keys <- function(data_clean = DIA_raw_norm, data_raw = DIA_raw_Minimal_filtered, precursor = fg_id, condition = r_condition, intensity = normalised_intensity_log2, r_replicate = r_replicate){
+  
+  data_NA <- data_clean %>%
+    dplyr::distinct( {{precursor}}, {{condition}}, {{r_replicate}}, {{intensity}}, .keep_all = TRUE ) %>% 
+    tidyr::complete( {{precursor}}, {{condition}}, {{r_replicate}}, fill = list(area = NA))%>%
+    #count missing values
+    group_by({{precursor}}, {{condition}})%>%
+    dplyr::mutate(missing = sum(is.na({{intensity}})))%>%
+    ungroup()%>%
+    dplyr::mutate(precond = paste({{precursor}},{{condition}}, sep = "_"))
+  
+  miss_keys <- get_keys(data_NA, group = precond, x = missing)
+  return(miss_keys)
+}
 
 
 
@@ -247,9 +393,12 @@ intensity_distribution_missingness <- function(data,grouping, intensity_log2, mi
 
 setwd(mainDir)
 
+#calculate logistic regresison for logistic regression neither assigment
+log_reg <- calculate_log_reg()
+# run imputation function
 set.seed(123)
-imputed <- DIA_imputation(DIA_raw_norm)
-
+imputed <- DIA_imputation(DIA_raw_norm, neither_assignment = "log_reg")
+#plot intensity distributions coolor coded for whethr values are imputed
 plot <- intensity_distribution_imputed(
   data = imputed,
   grouping = fg_id,
@@ -258,8 +407,9 @@ plot <- intensity_distribution_imputed(
 )
 
 plot
-ggsave("Intensity_distribution_imputed.pdf", plot = plot)
+ggsave("Intensity_distribution_imputed_log_reg.pdf", plot = plot)
 
+#plot intensities color coded for missingness classifications
 plot <- intensity_distribution_missingness(
   data = imputed,
   grouping = fg_id,
@@ -268,34 +418,128 @@ plot <- intensity_distribution_missingness(
 )
 
 plot
-ggsave("Intensity_distribution_missingness.pdf", plot = plot)
+ggsave("Intensity_distribution_missingness_log_reg.pdf", plot = plot)
 
 ```
 
 ```{r kernel_density_estimation, message=FALSE, warning=FALSE}
-setwd(mainDir)
+#create subdirectory for various kernel density estimation (KDE) plots
+subDir <- "KDE_by_missings"
 
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+#KDE of imputed data by missingness
 plot <- ggplot(aes(x= normalised_intensity_imputed_log2, colour = missingness), data = imputed) +
   xlim(0,25)+
   geom_density()+
-  ggtitle("KDE_imputed")
+  ggtitle("KDE_imputed_missing")
 
 plot
-ggsave("KDE_imputed.pdf", plot = plot)
-
+ggsave("KDE_imputed_missing.pdf", plot = plot)
+#KDE of non-imputed data by missingness
 plot <- ggplot(aes(x= normalised_intensity_log2, colour = missingness), data = imputed) +
   xlim(0,25)+
   geom_density()+
-  ggtitle("KDE_non-imputed")
-
+  ggtitle("KDE_non-imputed_missing")
 plot
-ggsave("KDE_non-imputed.pdf", plot = plot)
+ggsave("KDE_non-imputed_missing.pdf", plot = plot)
+
+# miss_keys <- get_miss_keys()
+# 
+# DIA_raw_norm <- DIA_raw_norm%>%mutate(precond = paste(fg_id,r_condition, sep = "_"))%>%mutate(missingness = miss_keys[precond,])%>%group_by(fg_id, r_condition)%>%mutate(mean = mean(normalised_intensity_log2))
+# 
+# DIA_raw_Minimal_filtered <- DIA_raw_Minimal_filtered%>%mutate(precond = paste(fg_id,r_condition, sep = "_"))%>%mutate(missing = miss_keys[precond,])%>%group_by(fg_id, r_condition)%>%mutate(mean = mean(normalised_intensity_log2))%>%mutate(missing = ifelse(is.na(missing), 4, missing))
+
+
+#KDE plot of non imputed data by number of missing replicates
+plot <- ggplot(aes(x= normalised_intensity_log2, colour = as.character(missing)), data = DIA_raw_Minimal_filtered) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_non-imputed_missing_min_filtered")
+plot
+ggsave("KDE_non-imputed_missing_min_filtered.pdf", plot = plot)
+
 ```
 
 
+```{r kernel_density_estimation by number of missing samples functions, message=FALSE, warning=FALSE}
+#functions to add maxline in KDEs but buggy at the moment
+#finds maximum within density function
+#https://ianmadd.github.io/pages/PeakDensityDistribution.html
+densMode <- function(x){
+    td <- density(x, na.rm = TRUE)
+    maxDens <- which.max(td$y)
+    return(td$x[maxDens])
+}
+
+#get list of maxes per missingness classification
+MaxDensList <- function(y, is_imputed = FALSE){
+  missing_values <- y%>%distinct(missingness)%>%arrange(missingness)                   
+  missing_v <- missing_values$missingness
+  modes = c()
+  for (i in 1:length(missing_v)){
+    list <- as.vector(y%>%filter(missingness == missing_v[i])%>%ungroup()%>%select(normalised_intensity_log2))
+    modes[i] <- densMode(list[[1]])
+  }
+  return(modes)
+}
+#get list of maxes per missingness classification - density functions fitted to means
+MaxDensList_mean <- function(y, is_imputed = FALSE){
+  missing_values <- y%>%distinct(missingness)%>%arrange(missingness)                   
+  missing_v <- missing_values$missingness
+  modes = c()
+  for (i in 1:length(missing_v)){
+    list <- as.vector(y%>%filter(missingness == missing_v[i])%>%ungroup()%>%select(mean))
+    modes[i] <- densMode(list[[1]])
+  }
+  return(modes)
+}
+
+```
+
+```{r kernel_density_estimation by number of missing samples , message=FALSE, warning=FALSE}
+
+#create subdirectory for various kernel density estimation (KDE) plots
+subDir <- "KDE_by_missings"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+#KDE by number of missing replicates on imputed data with line at max point
+plot <- ggplot(aes(x= normalised_intensity_imputed_log2, colour = as.character(missing)), data = imputed_raw) +
+  xlim(0,25)+
+  geom_density()+
+  ggtitle("KDE_missing_imputed")+
+  geom_vline(xintercept = MaxDensList(imputed_raw, is_imputed = TRUE))
+
+plot
+
+#KDE by number of missing replicates on non-imputed data with line at max point
+plot <- ggplot(aes(x= normalised_intensity_log2, colour = as.character(missing)), data = imputed_raw) +
+  xlim(0,25)+
+  geom_density(adjust = 0.5)+
+  ggtitle("KDE_missing_non-imputed")+
+  geom_vline(xintercept = MaxDensList(imputed_raw))
+
+plot
+
+
+
+```
+
 ```{r kernel_density_estimation, message=FALSE, warning=FALSE}
 setwd(mainDir)
-
+#plot percentage of data in the various missingness classification - non-imputed
 plot <- imputed%>%filter(imputed == FALSE)%>%count(missingness = factor(missingness))%>%mutate(pct = prop.table(n))%>%ggplot(aes(x = missingness, y=pct, label = scales::percent(pct))) + geom_col(position = 'dodge') + geom_text(position = position_dodge(width = .9),    # move to center of bars
               vjust = -0.5,    # nudge above top of bar
               size = 3) + 
@@ -303,7 +547,7 @@ plot <- imputed%>%filter(imputed == FALSE)%>%count(missingness = factor(missingn
     ggtitle("missingness_percentages_non-imputed")
 plot
 ggsave("missingness_percentages_non-imputed.pdf", plot = plot)
-
+#plot percentage of data in the various missingness classification - imputed
 plot <- imputed%>%count(missingness = factor(missingness))%>%mutate(pct = prop.table(n))%>%ggplot(aes(x = missingness, y=pct, label = scales::percent(pct))) + geom_col(position = 'dodge') + geom_text(position = position_dodge(width = .9),    # move to center of bars
               vjust = -0.5,    # nudge above top of bar
               size = 3) + 
@@ -317,8 +561,8 @@ ggsave("missingness_percentages_imputed.pdf", plot = plot)
 
 
 ```{r data completeness, message=FALSE, warning=FALSE}
-
-subDir <- "main plots"
+#create QC subdirectory - set as subdirectory
+subDir <- "QC"
 
 if (file.exists(subDir)){
     setwd(file.path(mainDir, subDir))
@@ -327,7 +571,7 @@ if (file.exists(subDir)){
     setwd(file.path(mainDir, subDir))
     
 }
-
+#plot data completeness in raw data
 plot <- qc_data_completeness(
   data = DIA_raw,
   sample = condrep,
@@ -339,7 +583,7 @@ plot <- qc_data_completeness(
 ggsave(filename = "data_completeness_raw.png", plot = plot)
 
 plot
-
+#plot data completeness in filtered normalised data
 plot <- qc_data_completeness(
   data = DIA_raw_norm,
   sample = condrep,
@@ -351,7 +595,7 @@ plot <- qc_data_completeness(
 ggsave(filename = "data_completeness_clean.png", plot = plot)
 
 plot
-
+#plot data completeness in imputed data
 plot <- qc_data_completeness(
   data = imputed,
   sample = condrep,
@@ -365,3 +609,91 @@ ggsave(filename = "data_completeness_imputed.png", plot = plot)
 plot
 
 ```
+
+
+
+```{r volcano's  functions, message=FALSE, warning=FALSE}
+#function outputs data to plot volcano of imputed data (and unimputed)
+Volcano_prep <- function(data, reference = "0_mM", treated = "2_mM", intensity = normalised_intensity_imputed_log2){
+  #filter out conditions not in reference or condition
+  data_filtered <- data%>%filter(r_condition %in% c(reference, treated))
+  #get dat ain form for calc diff abundance function
+  Volcano_input <- data_filtered %>%
+    unique() %>%
+    assign_missingness(sample = condrep,
+                       condition = r_condition,
+                       grouping = fg_id,
+                       intensity = {{intensity}},
+                       ref_condition = reference,
+                       retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+  
+  #calculate differential abundances an perform t-test 
+  t_test_result_pre <- calculate_diff_abundance(data = Volcano_input,
+                                  sample = condrep,
+                                 condition = r_condition,
+                                  grouping = fg_id,
+                                 intensity_log2 =  {{intensity}},
+                                  missingness,
+                                  comparison = comparison,
+                                  ref_condition = reference,
+                                  method = "t-test",
+                                  retain_columns = c(pg_protein_accessions, pep_stripped_sequence))
+  
+  
+  
+  
+  #filter data to only contain comparison wanted for volcano plot
+  condition_vulcano <- c(paste(treated, reference, sep ="_vs_"))
+  t_test_result_proDA_pep_comp <- t_test_result_pre[t_test_result_pre$comparison %in% condition_vulcano, ]
+  return(t_test_result_proDA_pep_comp)
+}
+#plot volcano from differential abundance dataset
+plot_volcano <- function(data, imputed = "imputed", treated ="2_mM"){
+  title = paste(paste("AT371_Volcano_plot", imputed, sep="_"), treated, sep="_")
+  plot <- volcano_plot(data, fg_id, diff, adj_pval, method = "target", target_column = pg_protein_accessions, x_axis_label = "log2(fold change)", title = title, y_axis_label = "-log10(p-value)", log2FC_cutoff = 1, significance_cutoff = 0.01, interactive = F)
+  plot
+  ggsave(paste(title, "png", sep="."), plot = plot)
+  
+}
+#extract hits from volcano plot
+get_hits <- function(data, imputed, reference ="0_mM", treated ="2_mM"){
+  imputed <-imputed%>%filter(r_condition%in%c(reference, treated))
+  prec_hits <- subset(data, adj_pval < 0.01 & (diff < -1 | diff > 1))
+  miss_keys_ref<-get_keys(imputed%>%filter(r_condition== reference), fg_id, missingness)
+  miss_keys_tr<-get_keys(imputed%>%filter(r_condition== treated), fg_id, missingness)
+  miss_ref = paste("missingness", reference, sep="_")
+  miss_tr = paste("missingness", treated, sep="_")
+  prec_hits[[miss_ref]] <-  miss_keys_ref[prec_hits$fg_id,]
+  prec_hits[[miss_tr]] <-  miss_keys_tr[prec_hits$fg_id,]
+  return(prec_hits)
+  }
+
+```
+
+```{r volcano's imputed, message=FALSE, warning=FALSE}
+#create subdirectory for volcano plots
+subDir <- "Volcano's"
+
+if (file.exists(subDir)){
+    setwd(file.path(mainDir, subDir))
+} else {
+    dir.create(file.path(mainDir, subDir))
+    setwd(file.path(mainDir, subDir))
+    
+}
+
+
+#run allfunction to get DAs for volcanos, plot volcanos, extract hits for imputed data
+t_test_result_imputed <- Volcano_prep(imputed, reference = "0_mM", treated = "2_mM")
+plot_volcano(data = t_test_result_imputed)
+prec_hits_imputed <- get_hits(data = t_test_result_imputed, imputed = imputed, reference ="0_mM", treated =  "2_mM")
+
+#run allfunction to get DAs for volcanos, plot volcanos, extract hits for non-imputed data
+t_test_result_nonimputed <- Volcano_prep(imputed, reference = "0_mM", treated = "2_mM", intensity = normalised_intensity_log2)
+plot_volcano(data = t_test_result_nonimputed, imputed = "non-imputed")
+prec_hits_nonimputed <- get_hits(data = t_test_result_nonimputed, imputed = imputed, reference = "0_mM", treated = "2_mM")
+
+#this code would have been used for benchmarking imputation methods using hits as readout rather than comparison to groundtruth intensities
+```
+
+
